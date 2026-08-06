@@ -1,0 +1,68 @@
+{
+  "profile_uri": "https://contenttelemetry.org/profiles/rsl/1",
+  "constrains": "Content Telemetry Specification 1.0",
+  "default_claimed_level": "retrieval",
+  "levels": {
+    "retrieval": {
+      "required_event_types": ["content_retrieved"]
+    },
+    "grounding": {
+      "required_event_types": [
+        "content_retrieved",
+        "content_grounded",
+        "turn_started",
+        "turn_completed"
+      ]
+    },
+    "citation": {
+      "required_event_types": [
+        "content_retrieved",
+        "content_grounded",
+        "turn_started",
+        "turn_completed",
+        "content_cited"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "id": "level_event_coverage",
+      "kind": "level_event_coverage",
+      "spec_ref": "RSL profile s7.1; standard s5.7",
+      "description": "A session claiming a conformance level reports every event type that level obliges. Levels are cumulative; grounding and above include turn events."
+    },
+    {
+      "id": "license_linkage",
+      "kind": "field_coverage",
+      "spec_ref": "RSL profile s7.2",
+      "field": "license_ref",
+      "applies_to": ["content_retrieved", "content_grounded", "content_cited"],
+      "description": "Content events for usage under an RSL licence carry a license_ref both parties can resolve to the licence."
+    },
+    {
+      "id": "cached_grounding_linkage",
+      "kind": "field_coverage",
+      "spec_ref": "RSL profile s7.2; standard s6.4",
+      "field": "license_ref",
+      "applies_to": ["content_grounded"],
+      "when_data_flag": "cached",
+      "description": "Cached groundings preserve the license_ref of the originating retrieval; reporting that stops when fetching stops does not satisfy the profile."
+    },
+    {
+      "id": "grounding_scope",
+      "kind": "field_coverage",
+      "spec_ref": "standard s5.7.2",
+      "data_field": "scope",
+      "applies_to": ["content_grounded"],
+      "description": "content_grounded events carry data.scope."
+    },
+    {
+      "id": "citation_type",
+      "kind": "field_coverage",
+      "spec_ref": "standard s5.7.3",
+      "data_field": "citation_type",
+      "applies_to": ["content_cited"],
+      "description": "content_cited events carry data.citation_type."
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    env:
+      # sqlx::test creates an ephemeral database per test, so this user needs
+      # CREATE DATABASE.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+
+      - run: cargo clippy --workspace --all-targets
+
+      - run: cargo test --workspace
+
+      - name: End-to-end smoke test
+        run: |
+          cargo build
+          psql "$DATABASE_URL" -c 'CREATE DATABASE smoke'
+          DATABASE_URL=postgres://postgres:postgres@localhost:5432/smoke ./scripts/smoke.sh
+        env:
+          PGPASSWORD: postgres

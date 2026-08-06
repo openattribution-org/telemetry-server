@@ -1,0 +1,781 @@
+//! Content Telemetry v1 conformance rules.
+//!
+//! Application-layer rules from the specification that JSON Schema cannot
+//! express (spec section 5.7.5), plus the value sets the standard defines.
+//! Pure functions only — callers decide how to log or surface the flags
+//! these return.
+
+use serde_json::Value;
+
+/// Schema versions this consumer accepts. During the 0.x preview period a
+/// consumer accepts the exact same minor version only (spec 5.7.4).
+pub const ACCEPTED_SCHEMA_VERSIONS: &[&str] = &["0.1"];
+
+/// Conformance levels the standard defines (spec 5.7).
+pub const STANDARD_CONFORMANCE_LEVELS: &[&str] = &["retrieval", "grounding", "citation"];
+
+/// Event types that carry content and therefore require an identifier
+/// (spec 5.7.5). Turn events and extension events are exempt.
+pub const CONTENT_EVENT_TYPES: &[&str] = &[
+    "content_retrieved",
+    "content_grounded",
+    "content_reproduced",
+    "content_cited",
+    "content_presented",
+    "content_engaged",
+];
+
+/// Closed enums on event `data` members (spec Annex A). Unlike the open
+/// string types (media_type, presentation_type, engagement_type,
+/// query_intent), the schema closes these: an out-of-set value makes the
+/// materialised session document schema-invalid.
+pub const CITATION_TYPES: &[&str] = &[
+    "direct_quote",
+    "paraphrase",
+    "reference",
+    "contradiction",
+    "unclassified",
+];
+pub const CITATION_POSITIONS: &[&str] = &["primary", "supporting", "mentioned", "unclassified"];
+pub const GROUNDING_SCOPES: &[&str] = &["session", "turn"];
+pub const REPRODUCTION_TYPES: &[&str] = &["verbatim", "near_verbatim", "unclassified"];
+pub const PRESENTATION_KINDS: &[&str] = &["content", "source_reference"];
+
+/// The event type v1 withdrew (spec 12.1). Emitters MUST NOT send it on the
+/// v1 integration line; stored v0.1 rows keep it and are quarantined under
+/// `extensions.events` at materialisation.
+pub const WITHDRAWN_EVENT_TYPE_DISPLAYED: &str = "content_displayed";
+
+/// V0.1 event `data` fields prohibited by the v1 migration rule (spec 9.1).
+/// The schemas cannot catch these — event `data` accepts additional
+/// properties by design — so the prohibition is enforced here. This is the
+/// v1 transition rule, not a general registry of withdrawn extension names.
+pub const WITHDRAWN_EVENT_DATA_FIELDS: &[&str] = &["ip_hash"];
+
+/// Conversation-turn privacy levels (spec 5.4). A closed enum: the schema
+/// rejects a turn whose `privacy_level` is outside this set.
+pub const PRIVACY_LEVELS: &[&str] = &["full", "summary", "intent", "minimal"];
+
+/// Normalise the closed-enum members of an event's `data` object so the
+/// materialised document validates against the schema (spec Annex A).
+/// `citation_type` and `position` carry `unclassified` for exactly this
+/// case, so unknown values map there; `scope` has no such member, so
+/// unknown values are dropped (the field is optional). `media_type` is an
+/// open vocabulary (core values plus emitter-defined ones, e.g. `3d`,
+/// `dataset`), so it is not normalised here. Returns the names of the
+/// fields changed.
+pub fn normalise_event_data_enums(event_type: &str, data: &mut Value) -> Vec<String> {
+    type Rule = (&'static str, &'static [&'static str], Option<&'static str>);
+    let rules: &[Rule] = match event_type {
+        "content_grounded" => &[("scope", GROUNDING_SCOPES, None)],
+        "content_cited" => &[
+            ("citation_type", CITATION_TYPES, Some("unclassified")),
+            ("position", CITATION_POSITIONS, Some("unclassified")),
+        ],
+        "content_reproduced" => &[(
+            "reproduction_type",
+            REPRODUCTION_TYPES,
+            Some("unclassified"),
+        )],
+        _ => return Vec::new(),
+    };
+
+    let Some(obj) = data.as_object_mut() else {
+        return Vec::new();
+    };
+
+    let mut changed = Vec::new();
+    for (field, allowed, fallback) in rules {
+        let valid = match obj.get(*field) {
+            None | Some(Value::Null) => true,
+            Some(Value::String(v)) => allowed.contains(&v.as_str()),
+            Some(_) => false,
+        };
+        if !valid {
+            match fallback {
+                Some(f) => {
+                    obj.insert((*field).to_string(), Value::String((*f).to_string()));
+                }
+                None => {
+                    obj.remove(*field);
+                }
+            }
+            changed.push((*field).to_string());
+        }
+    }
+    changed
+}
+
+/// Whether a document-level `schema_version` is acceptable. Absent versions
+/// are accepted and treated as the current version: the field postdates the
+/// earliest envelopes, so its absence carries no information.
+pub fn schema_version_accepted(version: Option<&str>) -> bool {
+    match version {
+        None => true,
+        Some(v) => ACCEPTED_SCHEMA_VERSIONS.contains(&v),
+    }
+}
+
+/// Result of normalising an emitter-supplied conformance level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalisedConformanceLevel {
+    pub value: Option<String>,
+    /// True when the supplied value is outside the standard's set. The field
+    /// is informational (spec 5.7), so this is a flag, never a rejection.
+    pub non_standard: bool,
+}
+
+/// Normalise a conformance level: the legacy pre-publication value
+/// `attribution` maps to `citation`; standard values pass through; anything
+/// else passes through flagged.
+pub fn normalise_conformance_level(value: Option<&str>) -> NormalisedConformanceLevel {
+    match value {
+        None => NormalisedConformanceLevel {
+            value: None,
+            non_standard: false,
+        },
+        Some("attribution") => NormalisedConformanceLevel {
+            value: Some("citation".to_string()),
+            non_standard: false,
+        },
+        Some(v) => NormalisedConformanceLevel {
+            value: Some(v.to_string()),
+            non_standard: !STANDARD_CONFORMANCE_LEVELS.contains(&v),
+        },
+    }
+}
+
+/// Whether a content event satisfies the identifier rule: at least one of
+/// `content_url` or `content_id` on every content event (spec 5.7.5).
+/// Non-content event types always pass.
+pub fn content_identifier_present(
+    event_type: &str,
+    content_url: Option<&str>,
+    content_id: Option<&str>,
+) -> bool {
+    if !CONTENT_EVENT_TYPES.contains(&event_type) {
+        return true;
+    }
+    content_url.is_some_and(|v| !v.is_empty()) || content_id.is_some_and(|v| !v.is_empty())
+}
+
+/// Strip the event `data` fields v1 withdrew (spec 9.1) in place, returning
+/// the names of the fields removed. A hashed IP address is a pseudonym, not
+/// an anonymous value, so `ip_hash` is treated as personal data: the
+/// consumer drops it rather than storing it, on ingest and again on read
+/// for rows written before this rule existed.
+pub fn strip_withdrawn_data_fields(data: &mut Value) -> Vec<String> {
+    let Some(obj) = data.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut stripped = Vec::new();
+    for field in WITHDRAWN_EVENT_DATA_FIELDS {
+        if obj.remove(*field).is_some() {
+            stripped.push((*field).to_string());
+        }
+    }
+    stripped
+}
+
+/// The v1 structural requirements the standard's JSON Schema enforces per
+/// event type (spec 5.2, 6.5-6.8): reproduction, citation and presentation
+/// events carry an emitter-assigned `id` and an `output_id`; reproduction
+/// and citation carry a resolvable source reference; reproduction carries
+/// `data.reproduction_type`; presentation carries `data.presentation_kind`
+/// (closed) and `data.presentation_type`; engagement carries the
+/// `presentation_id` of the exact presentation occurrence acted upon.
+///
+/// Returns a description of the first violation, or None when the event
+/// satisfies the v1 shape. Ingest rejects violations; materialisation uses
+/// the same rule to quarantine stored pre-v1 rows under `extensions.events`
+/// so the session document stays schema-valid.
+#[allow(clippy::too_many_arguments)]
+pub fn v1_structural_violation(
+    event_type: &str,
+    id_present: bool,
+    output_id: Option<&str>,
+    presentation_id_present: bool,
+    content_url: Option<&str>,
+    content_id: Option<&str>,
+    data: &Value,
+) -> Option<String> {
+    let data_str = |field: &str| -> Option<&str> { data.get(field).and_then(Value::as_str) };
+
+    match event_type {
+        "content_reproduced" | "content_cited" | "content_presented" => {
+            if !id_present {
+                return Some(format!("{event_type} events must carry an event id"));
+            }
+            if !output_id.is_some_and(|v| !v.is_empty()) {
+                return Some(format!("{event_type} events must carry output_id"));
+            }
+            match event_type {
+                "content_reproduced" | "content_cited" => {
+                    // Schema-enforced for these two types (spec 6.5, 6.6),
+                    // over and above the application-layer identifier rule.
+                    if !(content_url.is_some_and(|v| !v.is_empty())
+                        || content_id.is_some_and(|v| !v.is_empty()))
+                    {
+                        return Some(format!(
+                            "{event_type} events must carry a resolvable content_url or content_id"
+                        ));
+                    }
+                    if event_type == "content_reproduced"
+                        && !data_str("reproduction_type").is_some_and(|v| !v.is_empty())
+                    {
+                        return Some(
+                            "content_reproduced events must carry data.reproduction_type"
+                                .to_string(),
+                        );
+                    }
+                }
+                _ => {
+                    let kind = data_str("presentation_kind");
+                    if !kind.is_some_and(|v| PRESENTATION_KINDS.contains(&v)) {
+                        return Some(format!(
+                            "content_presented events must carry data.presentation_kind of: {}",
+                            PRESENTATION_KINDS.join(", ")
+                        ));
+                    }
+                    if !data_str("presentation_type").is_some_and(|v| !v.is_empty()) {
+                        return Some(
+                            "content_presented events must carry data.presentation_type"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            None
+        }
+        "content_engaged" => {
+            if presentation_id_present {
+                None
+            } else {
+                Some(
+                    "content_engaged events must carry presentation_id, referencing the \
+                     content_presented event acted upon"
+                        .to_string(),
+                )
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Conversation-turn fields that MUST NOT be present at each privacy level
+/// (spec 5.5). `minimal` keeps only token counts and content URL arrays;
+/// `intent` strips the raw query/response text. PrivacyLevel is a closed
+/// enum, so anything outside it fails closed to `minimal`: an
+/// unrecognised value must never grant more visibility than the most
+/// restrictive level.
+fn forbidden_turn_fields(privacy_level: &str) -> &'static [&'static str] {
+    match privacy_level {
+        "full" | "summary" => &[],
+        "intent" => &["query_text", "response_text"],
+        _ => &[
+            "query_text",
+            "response_text",
+            "query_intent",
+            "topics",
+            "response_type",
+            "response_mode",
+            "model_id",
+            "ad_rendered",
+        ],
+    }
+}
+
+/// Strip privacy-violating fields from a conversation turn in place,
+/// returning the names of the fields removed. A consumer that receives a
+/// privacy-violating turn strips the offending fields rather than rejecting
+/// the document carrying them (spec 5.7.5). Null-valued fields are not
+/// violations; only populated fields are stripped.
+///
+/// `privacy_level` is required on every turn (spec 5.4) and is a closed
+/// enum. A turn without one, or whose value is outside the enum (wrong
+/// case, stray whitespace, non-string), is stripped as `minimal` and its
+/// `privacy_level` rewritten to `minimal`: leaving the offending value in
+/// place would make the materialised session document schema-invalid.
+pub fn strip_turn_privacy_violations(turn: &mut Value) -> Vec<String> {
+    let Some(obj) = turn.as_object_mut() else {
+        return Vec::new();
+    };
+    let level = obj
+        .get("privacy_level")
+        .and_then(Value::as_str)
+        .filter(|v| PRIVACY_LEVELS.contains(v))
+        .map(ToString::to_string);
+
+    let forbidden = forbidden_turn_fields(level.as_deref().unwrap_or("minimal"));
+    let mut stripped = Vec::new();
+    for field in forbidden {
+        if obj.get(*field).is_some_and(|v| !v.is_null()) {
+            obj.remove(*field);
+            stripped.push((*field).to_string());
+        }
+    }
+    if level.is_none() {
+        obj.insert(
+            "privacy_level".to_string(),
+            Value::String("minimal".to_string()),
+        );
+    }
+    stripped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn closed_enums_with_unclassified_normalise_to_it() {
+        let mut data = json!({
+            "citation_type": "weird_unknown_type",
+            "position": "primary",
+            "excerpt_tokens": 12
+        });
+        let changed = normalise_event_data_enums("content_cited", &mut data);
+        assert_eq!(changed, vec!["citation_type"]);
+        assert_eq!(data["citation_type"], "unclassified");
+        assert_eq!(data["position"], "primary");
+        assert_eq!(data["excerpt_tokens"], 12);
+    }
+
+    #[test]
+    fn closed_enums_without_unclassified_drop_unknown_values() {
+        let mut data = json!({
+            "scope": "paragraph",
+            "cached": true
+        });
+        let changed = normalise_event_data_enums("content_grounded", &mut data);
+        assert_eq!(changed, vec!["scope"]);
+        assert!(data.get("scope").is_none());
+        assert_eq!(data["cached"], true);
+    }
+
+    #[test]
+    fn media_type_is_an_open_vocabulary() {
+        // media_type tolerates emitter-defined values beyond the core set
+        // (spec Annex A): unknown values pass through untouched.
+        for event_type in [
+            "content_retrieved",
+            "content_grounded",
+            "content_reproduced",
+            "content_cited",
+        ] {
+            let mut data = json!({ "media_type": "dataset" });
+            assert!(
+                normalise_event_data_enums(event_type, &mut data).is_empty(),
+                "{event_type} normalised an open media_type value"
+            );
+            assert_eq!(data["media_type"], "dataset");
+        }
+    }
+
+    #[test]
+    fn non_string_closed_enum_values_are_normalised_too() {
+        let mut data = json!({ "scope": 3, "citation_type": ["a"] });
+        let changed = normalise_event_data_enums("content_grounded", &mut data);
+        assert_eq!(changed, vec!["scope"]);
+        assert!(data.get("scope").is_none());
+
+        let mut data = json!({ "citation_type": ["a"] });
+        let changed = normalise_event_data_enums("content_cited", &mut data);
+        assert_eq!(changed, vec!["citation_type"]);
+        assert_eq!(data["citation_type"], "unclassified");
+    }
+
+    #[test]
+    fn standard_values_and_other_event_types_left_alone() {
+        let mut data = json!({ "scope": "turn", "media_type": "text" });
+        assert!(normalise_event_data_enums("content_grounded", &mut data).is_empty());
+        assert_eq!(data["scope"], "turn");
+
+        // turn events and extension events carry no closed data enums.
+        let mut data = json!({ "citation_type": "nonsense" });
+        assert!(normalise_event_data_enums("turn_completed", &mut data).is_empty());
+        assert_eq!(data["citation_type"], "nonsense");
+
+        // null and absent members are not violations.
+        let mut data = json!({ "scope": null });
+        assert!(normalise_event_data_enums("content_grounded", &mut data).is_empty());
+    }
+
+    #[test]
+    fn schema_version_accepts_exact_minor_and_absent() {
+        assert!(schema_version_accepted(None));
+        assert!(schema_version_accepted(Some("0.1")));
+        assert!(!schema_version_accepted(Some("0.2")));
+        assert!(!schema_version_accepted(Some("1.0")));
+    }
+
+    #[test]
+    fn conformance_level_maps_legacy_attribution_to_citation() {
+        let n = normalise_conformance_level(Some("attribution"));
+        assert_eq!(n.value.as_deref(), Some("citation"));
+        assert!(!n.non_standard);
+    }
+
+    #[test]
+    fn conformance_level_passes_standard_values() {
+        for v in STANDARD_CONFORMANCE_LEVELS {
+            let n = normalise_conformance_level(Some(v));
+            assert_eq!(n.value.as_deref(), Some(*v));
+            assert!(!n.non_standard);
+        }
+    }
+
+    #[test]
+    fn conformance_level_flags_unknown_values_without_rejecting() {
+        let n = normalise_conformance_level(Some("platinum"));
+        assert_eq!(n.value.as_deref(), Some("platinum"));
+        assert!(n.non_standard);
+    }
+
+    #[test]
+    fn reproduction_type_normalises_to_unclassified() {
+        let mut data = json!({ "reproduction_type": "loose_paraphrase", "reproduced_chars": 90 });
+        let changed = normalise_event_data_enums("content_reproduced", &mut data);
+        assert_eq!(changed, vec!["reproduction_type"]);
+        assert_eq!(data["reproduction_type"], "unclassified");
+        assert_eq!(data["reproduced_chars"], 90);
+    }
+
+    #[test]
+    fn withdrawn_ip_hash_is_stripped() {
+        let mut data = json!({
+            "ip_hash": "sha256:d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5",
+            "country": "US"
+        });
+        assert_eq!(strip_withdrawn_data_fields(&mut data), vec!["ip_hash"]);
+        assert!(data.get("ip_hash").is_none());
+        assert_eq!(data["country"], "US");
+
+        let mut clean = json!({ "country": "US" });
+        assert!(strip_withdrawn_data_fields(&mut clean).is_empty());
+    }
+
+    #[test]
+    fn v1_structure_requires_output_identity_on_response_layer_events() {
+        for event_type in ["content_reproduced", "content_cited", "content_presented"] {
+            let data = match event_type {
+                "content_reproduced" => json!({ "reproduction_type": "verbatim" }),
+                "content_presented" => {
+                    json!({ "presentation_kind": "source_reference", "presentation_type": "link" })
+                }
+                _ => json!({}),
+            };
+            assert!(
+                v1_structural_violation(
+                    event_type,
+                    true,
+                    Some("response:1"),
+                    false,
+                    Some("https://example.com/a"),
+                    None,
+                    &data
+                )
+                .is_none(),
+                "{event_type} rejected a conforming event"
+            );
+            assert!(
+                v1_structural_violation(
+                    event_type,
+                    true,
+                    None,
+                    false,
+                    Some("https://example.com/a"),
+                    None,
+                    &data
+                )
+                .is_some(),
+                "{event_type} accepted a missing output_id"
+            );
+            assert!(
+                v1_structural_violation(
+                    event_type,
+                    false,
+                    Some("response:1"),
+                    false,
+                    Some("https://example.com/a"),
+                    None,
+                    &data
+                )
+                .is_some(),
+                "{event_type} accepted a missing event id"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_structure_requires_source_reference_on_reproduced_and_cited() {
+        for event_type in ["content_reproduced", "content_cited"] {
+            let data = json!({ "reproduction_type": "verbatim" });
+            assert!(
+                v1_structural_violation(
+                    event_type,
+                    true,
+                    Some("response:1"),
+                    false,
+                    None,
+                    None,
+                    &data
+                )
+                .is_some(),
+                "{event_type} accepted an event with no source reference"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_structure_requires_typed_reproduction_and_presentation_data() {
+        assert!(
+            v1_structural_violation(
+                "content_reproduced",
+                true,
+                Some("response:1"),
+                false,
+                Some("https://example.com/a"),
+                None,
+                &json!({})
+            )
+            .is_some()
+        );
+        // presentation_kind is closed with no fallback member, so an
+        // out-of-set value is a violation, not a normalisation case.
+        assert!(
+            v1_structural_violation(
+                "content_presented",
+                true,
+                Some("response:1"),
+                false,
+                Some("https://example.com/a"),
+                None,
+                &json!({ "presentation_kind": "hologram", "presentation_type": "link" })
+            )
+            .is_some()
+        );
+        // presentation_type is an open vocabulary: custom values pass.
+        assert!(
+            v1_structural_violation(
+                "content_presented",
+                true,
+                Some("response:1"),
+                false,
+                Some("https://example.com/a"),
+                None,
+                &json!({ "presentation_kind": "content", "presentation_type": "hologram" })
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn v1_structure_requires_presentation_id_on_engagement() {
+        assert!(
+            v1_structural_violation(
+                "content_engaged",
+                false,
+                None,
+                true,
+                Some("https://example.com/a"),
+                None,
+                &json!({ "engagement_type": "link_click" })
+            )
+            .is_none()
+        );
+        assert!(
+            v1_structural_violation(
+                "content_engaged",
+                false,
+                None,
+                false,
+                Some("https://example.com/a"),
+                None,
+                &json!({ "engagement_type": "link_click" })
+            )
+            .is_some()
+        );
+        // Other event types carry no v1 structural requirements.
+        assert!(
+            v1_structural_violation(
+                "content_retrieved",
+                false,
+                None,
+                false,
+                None,
+                None,
+                &json!({})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn content_identifier_required_on_content_events_only() {
+        assert!(!content_identifier_present("content_grounded", None, None));
+        assert!(content_identifier_present(
+            "content_grounded",
+            Some("https://example.com/a"),
+            None
+        ));
+        assert!(content_identifier_present(
+            "content_cited",
+            None,
+            Some("cms:123")
+        ));
+        assert!(content_identifier_present("turn_started", None, None));
+        assert!(content_identifier_present("checkout_completed", None, None));
+    }
+
+    #[test]
+    fn minimal_turn_strips_everything_but_tokens_and_urls() {
+        let mut turn = json!({
+            "privacy_level": "minimal",
+            "query_text": "secret question",
+            "query_intent": "comparison",
+            "topics": ["a"],
+            "response_type": "recommendation",
+            "response_mode": "standard",
+            "model_id": "m",
+            "ad_rendered": true,
+            "response_tokens": 280,
+            "content_urls_cited": ["https://example.com/a"]
+        });
+        let mut stripped = strip_turn_privacy_violations(&mut turn);
+        stripped.sort();
+        assert_eq!(
+            stripped,
+            vec![
+                "ad_rendered",
+                "model_id",
+                "query_intent",
+                "query_text",
+                "response_mode",
+                "response_type",
+                "topics"
+            ]
+        );
+        assert_eq!(turn["response_tokens"], 280);
+        assert_eq!(turn["content_urls_cited"][0], "https://example.com/a");
+        assert!(turn.get("query_text").is_none());
+    }
+
+    #[test]
+    fn intent_turn_strips_text_only() {
+        let mut turn = json!({
+            "privacy_level": "intent",
+            "query_text": "secret",
+            "query_intent": "comparison",
+            "topics": ["headphones"]
+        });
+        let stripped = strip_turn_privacy_violations(&mut turn);
+        assert_eq!(stripped, vec!["query_text"]);
+        assert_eq!(turn["query_intent"], "comparison");
+    }
+
+    #[test]
+    fn full_and_summary_turns_untouched() {
+        for level in ["full", "summary"] {
+            let mut turn = json!({
+                "privacy_level": level,
+                "query_text": "q",
+                "response_text": "r"
+            });
+            assert!(strip_turn_privacy_violations(&mut turn).is_empty());
+            assert_eq!(turn["query_text"], "q");
+        }
+    }
+
+    #[test]
+    fn unknown_privacy_levels_fail_closed_to_minimal() {
+        // Capitalisation, stray whitespace, and made-up values are all
+        // outside the PrivacyLevel enum and must strip like `minimal`.
+        for level in ["Minimal", "minimal ", "FULL", "platinum", ""] {
+            let mut turn = json!({
+                "privacy_level": level,
+                "query_text": "secret question",
+                "query_intent": "comparison",
+                "response_tokens": 280
+            });
+            let stripped = strip_turn_privacy_violations(&mut turn);
+            assert!(
+                stripped.contains(&"query_text".to_string()),
+                "level {level:?} did not strip query_text"
+            );
+            assert!(turn.get("query_text").is_none());
+            assert!(turn.get("query_intent").is_none());
+            assert_eq!(turn["response_tokens"], 280);
+        }
+    }
+
+    #[test]
+    fn invalid_privacy_levels_rewritten_to_minimal() {
+        // Stripping alone is not enough: privacy_level is a closed enum,
+        // so an out-of-enum value left in place would fail the standard
+        // schema on the materialised document.
+        let invalid = [
+            json!("Minimal"),
+            json!("minimal "),
+            json!("ultra"),
+            json!(5),
+            Value::Null,
+        ];
+        for level in invalid {
+            let mut turn = json!({
+                "query_text": "secret question",
+                "query_intent": "comparison",
+                "response_tokens": 280
+            });
+            if !level.is_null() {
+                turn["privacy_level"] = level.clone();
+            }
+            strip_turn_privacy_violations(&mut turn);
+            assert_eq!(
+                turn["privacy_level"], "minimal",
+                "level {level:?} was not rewritten to minimal"
+            );
+            assert!(turn.get("query_text").is_none());
+            assert!(turn.get("query_intent").is_none());
+            assert_eq!(turn["response_tokens"], 280);
+        }
+
+        // Valid levels are never rewritten.
+        for level in PRIVACY_LEVELS {
+            let mut turn = json!({ "privacy_level": level, "response_tokens": 1 });
+            strip_turn_privacy_violations(&mut turn);
+            assert_eq!(turn["privacy_level"], *level);
+        }
+    }
+
+    #[test]
+    fn missing_privacy_level_strips_as_minimal() {
+        let mut turn = json!({
+            "query_text": "secret question",
+            "topics": ["a"],
+            "response_tokens": 12
+        });
+        let mut stripped = strip_turn_privacy_violations(&mut turn);
+        stripped.sort();
+        assert_eq!(stripped, vec!["query_text", "topics"]);
+        assert_eq!(turn["response_tokens"], 12);
+
+        let mut non_string = json!({
+            "privacy_level": 3,
+            "query_text": "secret question"
+        });
+        let stripped = strip_turn_privacy_violations(&mut non_string);
+        assert_eq!(stripped, vec!["query_text"]);
+    }
+
+    #[test]
+    fn null_fields_are_not_violations() {
+        let mut turn = json!({
+            "privacy_level": "minimal",
+            "query_text": null,
+            "response_tokens": 12
+        });
+        assert!(strip_turn_privacy_violations(&mut turn).is_empty());
+    }
+}

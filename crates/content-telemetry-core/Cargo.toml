@@ -1,0 +1,29 @@
+[package]
+name = "content-telemetry-core"
+description = "Core types, validation and storage services for the Content Telemetry standard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+chrono.workspace = true
+dashmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros"] }
+tracing.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["v5"] }
+
+[dev-dependencies]
+sqlx.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
