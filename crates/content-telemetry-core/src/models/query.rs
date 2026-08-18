@@ -17,6 +17,7 @@ pub struct PublisherSummary {
     pub total_sessions: i64,
     pub events_by_type: Vec<EventTypeCount>,
     pub events_by_source: Vec<SourceRoleCount>,
+    pub events_by_status: Vec<StatusCodeCount>,
     pub agents: Vec<AgentBreakdown>,
     pub period_start: Option<DateTime<Utc>>,
     pub period_end: Option<DateTime<Utc>>,
@@ -27,6 +28,15 @@ pub struct SourceRoleCount {
     pub source_role: Option<String>,
     pub count: i64,
     pub sessions: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusCodeCount {
+    /// HTTP status observed at the edge (event_data.response_status). None
+    /// bucket counts events whose source recorded no status — only the edge
+    /// enrichment profile stamps one, so self-reported events land there.
+    pub status: Option<i32>,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

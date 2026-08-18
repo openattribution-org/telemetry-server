@@ -7,7 +7,7 @@ use crate::models::query::{
     AgentAttestedCounts, AgentBreakdown, AgentDomainBreakdown, AgentDomainMetric,
     AgentReconciliation, AgentSummary, DayFunnelCount, DomainPreview, DomainPreviewUrl,
     EventTypeCount, Paginated, PublisherEvent, PublisherSummary, PublisherUrlMetric,
-    SourceRoleCount, UnclaimedDomain,
+    SourceRoleCount, StatusCodeCount, UnclaimedDomain,
 };
 
 /// Get publisher summary with event counts filtered by their domains.
@@ -93,11 +93,12 @@ pub async fn get_publisher_summary(
         q = q.bind(c);
     }
 
-    // Run event counts, source breakdown, and agent breakdown concurrently —
+    // Run event counts, source, status, and agent breakdowns concurrently —
     // they scan the same data independently, so parallelising cuts dashboard latency.
-    let (rows, source_rows, agents) = tokio::try_join!(
+    let (rows, source_rows, status_rows, agents) = tokio::try_join!(
         q.fetch_all(pool),
         query_source_breakdown(pool, &patterns, since, until, bot, bot_category),
+        query_status_breakdown(pool, &patterns, since, until, bot, bot_category),
         query_agent_breakdown(pool, &patterns, since, until, bot, bot_category),
     )?;
 
@@ -118,6 +119,13 @@ pub async fn get_publisher_summary(
             sessions: r.sessions,
         })
         .collect();
+    let events_by_status: Vec<StatusCodeCount> = status_rows
+        .into_iter()
+        .map(|r| StatusCodeCount {
+            status: r.status,
+            count: r.count,
+        })
+        .collect();
 
     Ok(PublisherSummary {
         organization_id: owner_id,
@@ -127,6 +135,7 @@ pub async fn get_publisher_summary(
         total_sessions,
         events_by_type,
         events_by_source,
+        events_by_status,
         agents,
         period_start: since,
         period_end: until,
@@ -1229,6 +1238,73 @@ async fn query_source_breakdown(
     q.fetch_all(pool).await
 }
 
+async fn query_status_breakdown(
+    pool: &PgPool,
+    patterns: &[String],
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    bot: Option<&str>,
+    bot_category: Option<&str>,
+) -> Result<Vec<StatusCodeRow>, sqlx::Error> {
+    let like_clauses: Vec<String> = (1..=patterns.len())
+        .map(|i| format!("e.content_url LIKE ${i}"))
+        .collect();
+    let where_like = like_clauses.join(" OR ");
+
+    let mut time_filter = String::new();
+    let mut param_idx = patterns.len() + 1;
+    if since.is_some() {
+        time_filter.push_str(&format!(" AND e.event_timestamp >= ${param_idx}"));
+        param_idx += 1;
+    }
+    if until.is_some() {
+        time_filter.push_str(&format!(" AND e.event_timestamp <= ${param_idx}"));
+        param_idx += 1;
+    }
+    if bot.is_some() {
+        time_filter.push_str(&format!(" AND e.event_data->>'bot_name' = ${param_idx}"));
+        param_idx += 1;
+    }
+    if bot_category.is_some() {
+        time_filter.push_str(&format!(
+            " AND e.event_data->>'bot_category' = ${param_idx}"
+        ));
+    }
+
+    // Only the edge enrichment profile stamps response_status; the guarded
+    // cast folds any event without a numeric status into the NULL bucket
+    // rather than failing the whole aggregation on malformed data.
+    let sql = format!(
+        "SELECT CASE WHEN e.event_data->>'response_status' ~ '^[0-9]+$'
+                     THEN (e.event_data->>'response_status')::int
+                END as status,
+                COUNT(*) as count
+         FROM events e
+         WHERE ({where_like}){time_filter}
+         GROUP BY status
+         ORDER BY count DESC"
+    );
+
+    let mut q = sqlx::query_as::<_, StatusCodeRow>(&sql);
+    for p in patterns {
+        q = q.bind(p);
+    }
+    if let Some(ref s) = since {
+        q = q.bind(s);
+    }
+    if let Some(ref u) = until {
+        q = q.bind(u);
+    }
+    if let Some(b) = bot {
+        q = q.bind(b);
+    }
+    if let Some(c) = bot_category {
+        q = q.bind(c);
+    }
+
+    q.fetch_all(pool).await
+}
+
 async fn query_agent_breakdown(
     pool: &PgPool,
     patterns: &[String],
@@ -1715,6 +1791,7 @@ fn empty_summary(owner_id: Uuid, domains: &[String]) -> PublisherSummary {
         total_sessions: 0,
         events_by_type: vec![],
         events_by_source: vec![],
+        events_by_status: vec![],
         agents: vec![],
         period_start: None,
         period_end: None,
@@ -1788,6 +1865,12 @@ struct SourceRoleRow {
     source_role: Option<String>,
     count: i64,
     sessions: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct StatusCodeRow {
+    status: Option<i32>,
+    count: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]

@@ -687,3 +687,78 @@ async fn publisher_category_filter_includes_stamped_agent_citations(pool: PgPool
         "inference category should include the stamped citation"
     );
 }
+
+// ===================================================================
+// Publisher summary: HTTP status-code breakdown. Only edge enrichment
+// stamps response_status; everything else must land in the NULL bucket
+// rather than being dropped or failing the aggregation.
+// ===================================================================
+
+#[sqlx::test(migrations = "./migrations", fixtures("setup"))]
+async fn publisher_summary_breaks_down_status_codes(pool: PgPool) {
+    let mk_edge = |status: serde_json::Value| EdgeEventInput {
+        id: None,
+        event_type: "content_retrieved".to_string(),
+        timestamp: Utc::now(),
+        source_role: Some("edge".to_string()),
+        content_telemetry_id: None,
+        content_url: Some("https://example.com/a".to_string()),
+        content_id: None,
+        license_ref: None,
+        data: serde_json::json!({"bot_name": "GPTBot", "bot_category": "training", "response_status": status}),
+    };
+    let edge = vec![
+        mk_edge(serde_json::json!(200)),
+        mk_edge(serde_json::json!(200)),
+        mk_edge(serde_json::json!(404)),
+        // Malformed status must fold into the NULL bucket, not error the query.
+        mk_edge(serde_json::json!("cached")),
+    ];
+    events::create_edge_events(&pool, publisher_org_id(), &edge)
+        .await
+        .unwrap();
+
+    // A self-report event with no response_status also lands in NULL.
+    let agent_org = agent_org_id();
+    let session = sessions::create_session(&pool, agent_org, &minimal_session_request())
+        .await
+        .unwrap();
+    let inputs = vec![agent_event(
+        "content_cited",
+        "https://example.com/a",
+        serde_json::json!({}),
+    )];
+    events::create_events(&pool, session.id, agent_org, &inputs)
+        .await
+        .unwrap();
+
+    let domains = vec!["example.com".to_string()];
+    let summary = queries::get_publisher_summary(
+        &pool,
+        publisher_org_id(),
+        &domains,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let count_for = |status: Option<i32>| {
+        summary
+            .events_by_status
+            .iter()
+            .find(|r| r.status == status)
+            .map(|r| r.count)
+            .unwrap_or(0)
+    };
+    assert_eq!(count_for(Some(200)), 2, "two 200 edge retrievals");
+    assert_eq!(count_for(Some(404)), 1, "one 404 edge retrieval");
+    assert_eq!(
+        count_for(None),
+        2,
+        "malformed and statusless events fold into the NULL bucket"
+    );
+}
