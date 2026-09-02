@@ -71,7 +71,7 @@ fn meets_v1_structure(row: &EventRow, prepared_data: &Value) -> bool {
         && crate::conformance::field_placement_violation(
             &row.event_type,
             row.presentation_id.is_some(),
-            false, // stored rows gain a ctx_token column in migration 0003
+            row.ctx_token.is_some(),
             row.citation_id.is_some(),
             row.turn_data.is_some(),
         )
@@ -108,6 +108,16 @@ fn standard_event(row: &EventRow, prepared_data: &Value) -> Value {
         "presentation_id",
         row.presentation_id.map(|v| json!(v)),
     );
+    // The event-level ctx_token belongs on content_engaged only (spec 5.2,
+    // 5.7.5): the agent records the token minted for the engaged
+    // presentation so destination reports join to it.
+    if row.event_type == "content_engaged" {
+        insert_if_some(
+            &mut event,
+            "ctx_token",
+            row.ctx_token.clone().map(Value::from),
+        );
+    }
     insert_if_some(
         &mut event,
         "source_role",
@@ -132,6 +142,13 @@ fn standard_event(row: &EventRow, prepared_data: &Value) -> Value {
         &mut event,
         "license_ref",
         row.license_ref.clone().map(Value::from),
+    );
+    // terms_ref passes through byte-for-byte (spec 5.2.4): a processor MUST
+    // preserve it unchanged and MUST NOT remove or rewrite it.
+    insert_if_some(
+        &mut event,
+        "terms_ref",
+        row.terms_ref.clone().map(Value::from),
     );
     insert_if_some(&mut event, "turn", row.turn_data.clone());
     if !prepared_data.is_null() {
@@ -335,7 +352,9 @@ mod tests {
             output_element_id: None,
             citation_id: None,
             presentation_id: None,
+            ctx_token: None,
             license_ref: None,
+            terms_ref: None,
             product_id: None,
             turn_data: None,
             event_data: data,
@@ -393,6 +412,47 @@ mod tests {
         // Quarantined rows keep the claims their emitters made.
         let reproduced = &doc["extensions"]["events"][0];
         assert_eq!(reproduced["data"]["reproduction_type"], "verbatim");
+    }
+
+    #[test]
+    fn ctx_token_and_terms_ref_materialise_where_the_spec_places_them() {
+        let mut engaged = event_row(
+            "content_engaged",
+            json!({ "engagement_type": "link_click" }),
+        );
+        engaged.presentation_id = Some(Uuid::new_v4());
+        engaged.ctx_token = Some("ct_dGVzdHRva2VudmFsdWU".to_string());
+        engaged.terms_ref = Some("https://example.com/terms/2026-01".to_string());
+
+        let mut grounded = event_row("content_grounded", json!({ "scope": "session" }));
+        grounded.terms_ref = Some("opaque:terms-77".to_string());
+
+        // A pre-v1-tolerated row with a ctx_token on the wrong type is
+        // quarantined by the field-placement rule, never emitted as core.
+        let mut misplaced = event_row("content_grounded", json!({ "scope": "session" }));
+        misplaced.ctx_token = Some("ct_bWlzcGxhY2VkdG9rZW4".to_string());
+
+        let swe = SessionWithEvents {
+            session: session_row(),
+            events: vec![engaged, grounded, misplaced],
+        };
+        let doc = standard_document(&swe);
+
+        assert_eq!(
+            event_types(&doc, "/events"),
+            vec!["content_engaged", "content_grounded"]
+        );
+        assert_eq!(doc["events"][0]["ctx_token"], "ct_dGVzdHRva2VudmFsdWU");
+        // terms_ref passes through byte-for-byte on any event (spec 5.2.4).
+        assert_eq!(
+            doc["events"][0]["terms_ref"],
+            "https://example.com/terms/2026-01"
+        );
+        assert_eq!(doc["events"][1]["terms_ref"], "opaque:terms-77");
+        assert_eq!(
+            event_types(&doc, "/extensions/events"),
+            vec!["content_grounded"]
+        );
     }
 
     #[test]
