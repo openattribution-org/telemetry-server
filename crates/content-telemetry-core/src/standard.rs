@@ -31,13 +31,29 @@ const CORE_EVENT_TYPES: &[&str] = &[
     "turn_completed",
 ];
 
+/// Prepare a stored row's `data` for the v1 document: normalise closed
+/// enums (spec Annex A), strip the fields v1 withdrew (spec 9.1), and apply
+/// the spec 12.1 migration defaults for rows written before versioned
+/// ingest. Rows ingested on the v1 line come out unchanged; pre-v1 rows
+/// come out reading as the v1 document the migration rules define.
+fn prepared_event_data(row: &EventRow) -> Value {
+    let mut data = row.event_data.clone();
+    if !data.is_null() {
+        crate::conformance::normalise_event_data_enums(&row.event_type, &mut data);
+        crate::conformance::strip_withdrawn_data_fields(&mut data);
+    }
+    crate::conformance::apply_v0_migration(&row.event_type, row.turn_id.as_deref(), &mut data);
+    data
+}
+
 /// Whether a stored row satisfies the v1 structural requirements for its
-/// event type. Rows ingested on the v1 line always do (ingest rejects
-/// violations); pre-v1 rows that do not - an engagement without a
-/// `presentation_id`, a citation without an `output_id` - are quarantined
-/// under `extensions.events` so the materialised document stays valid
-/// against the v1 schema.
-fn meets_v1_structure(row: &EventRow) -> bool {
+/// event type, judged against its prepared (migration-normalised) `data`.
+/// Rows ingested on the v1 line always do (ingest rejects violations);
+/// pre-v1 rows that still do not after normalisation - an engagement
+/// without a `presentation_id`, a citation without an `output_id` - are
+/// quarantined under `extensions.events` so the materialised document stays
+/// valid against the v1 schema.
+fn meets_v1_structure(row: &EventRow, prepared_data: &Value) -> bool {
     crate::conformance::v1_structural_violation(
         &row.event_type,
         true,
@@ -45,7 +61,7 @@ fn meets_v1_structure(row: &EventRow) -> bool {
         row.presentation_id.is_some(),
         row.content_url.as_deref(),
         row.content_id.as_deref(),
-        &row.event_data,
+        prepared_data,
     )
     .is_none()
 }
@@ -58,7 +74,7 @@ fn insert_if_some(obj: &mut Map<String, Value>, key: &str, value: Option<Value>)
     }
 }
 
-fn standard_event(row: &EventRow) -> Value {
+fn standard_event(row: &EventRow, prepared_data: &Value) -> Value {
     let mut event = Map::new();
     event.insert("id".to_string(), json!(row.id));
     event.insert("type".to_string(), json!(row.event_type));
@@ -106,16 +122,13 @@ fn standard_event(row: &EventRow) -> Value {
         row.license_ref.clone().map(Value::from),
     );
     insert_if_some(&mut event, "turn", row.turn_data.clone());
-    if !row.event_data.is_null() {
+    if !prepared_data.is_null() {
         // Rows stored before ingest normalised closed enums can still carry
-        // out-of-set values; normalise again on read so the materialised
-        // document always validates (spec Annex A). The same applies to the
-        // fields v1 withdrew (spec 9.1): rows written before the ip_hash
-        // prohibition are stripped on read.
-        let mut data = row.event_data.clone();
-        crate::conformance::normalise_event_data_enums(&row.event_type, &mut data);
-        crate::conformance::strip_withdrawn_data_fields(&mut data);
-        event.insert("data".to_string(), data);
+        // out-of-set values, and rows stored before versioned ingest can
+        // lack the members v1 requires; `prepared_event_data` normalised,
+        // migrated (spec 12.1) and stripped (spec 9.1) them on read so the
+        // materialised document always validates.
+        event.insert("data".to_string(), prepared_data.clone());
     }
     // product_id is an extension field; carry it inside data where the
     // schema permits custom members, not as a top-level event field.
@@ -142,7 +155,12 @@ pub fn standard_document(swe: &SessionWithEvents) -> Value {
 
     let mut doc = Map::new();
     doc.insert("document_type".to_string(), json!("session"));
-    doc.insert("schema_version".to_string(), json!("0.1"));
+    // The document this module builds is a v1 session document: stored rows
+    // are read under the spec 12.1 migration rules (scope and citation_type
+    // defaults, bot_category as purpose) and rows that still do not satisfy
+    // the v1 shape are quarantined under `extensions.events`, so the stamp
+    // is truthful after normalisation.
+    doc.insert("schema_version".to_string(), json!("1.0"));
     doc.insert("session_id".to_string(), json!(session.id));
     insert_if_some(
         &mut doc,
@@ -184,20 +202,34 @@ pub fn standard_document(swe: &SessionWithEvents) -> Value {
         None => {}
     }
 
-    let (core_events, extension_events): (Vec<&EventRow>, Vec<&EventRow>) = swe
+    type Prepared<'a> = Vec<(&'a EventRow, Value)>;
+    let (core_events, extension_events): (Prepared<'_>, Prepared<'_>) = swe
         .events
         .iter()
-        .partition(|e| CORE_EVENT_TYPES.contains(&e.event_type.as_str()) && meets_v1_structure(e));
+        .map(|e| (e, prepared_event_data(e)))
+        .partition(|(e, data)| {
+            CORE_EVENT_TYPES.contains(&e.event_type.as_str()) && meets_v1_structure(e, data)
+        });
 
     doc.insert(
         "events".to_string(),
-        Value::Array(core_events.iter().map(|e| standard_event(e)).collect()),
+        Value::Array(
+            core_events
+                .iter()
+                .map(|(e, data)| standard_event(e, data))
+                .collect(),
+        ),
     );
 
     if !extension_events.is_empty() {
         extensions.insert(
             "events".to_string(),
-            Value::Array(extension_events.iter().map(|e| standard_event(e)).collect()),
+            Value::Array(
+                extension_events
+                    .iter()
+                    .map(|(e, data)| standard_event(e, data))
+                    .collect(),
+            ),
         );
     }
 

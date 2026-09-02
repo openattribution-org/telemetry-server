@@ -7,9 +7,40 @@
 
 use serde_json::Value;
 
-/// Schema versions this consumer accepts. During the 0.x preview period a
-/// consumer accepts the exact same minor version only (spec 5.7.4).
-pub const ACCEPTED_SCHEMA_VERSIONS: &[&str] = &["0.1"];
+/// Schema versions this consumer accepts. `"1.0"` is the version this
+/// implementation targets. `"0.1"` remains accepted for the transition:
+/// live member edge workers still declare it, and spec 12.1 gives a
+/// consumer explicit migration rules for reading preview documents
+/// (`bot_category` as `purpose`, defaulted `scope` and `citation_type`).
+/// Under the spec's own rule the two lines do not interoperate — a strict
+/// v1 consumer rejects `"0.1"` — so accepting both is a deliberate,
+/// temporary deployment choice, not the 5.7.4 default. Documents declaring
+/// `"1.0"` get full v1 strictness; documents declaring `"0.1"` are
+/// normalised per 12.1 where a rule exists and tolerated otherwise.
+pub const ACCEPTED_SCHEMA_VERSIONS: &[&str] = &["0.1", "1.0"];
+
+/// The two schema lines this consumer reads. Which line a document declares
+/// decides how much strictness applies at ingest: `V1_0` documents are held
+/// to the v1 structural rules, `V0_1` documents are migrated per spec 12.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaLine {
+    /// The v0.1 preview line, read under the migration rules of spec 12.1.
+    V0_1,
+    /// The v1.0 line, held to the full v1 structural rules.
+    V1_0,
+}
+
+/// Which schema line a declared `schema_version` selects, or None when the
+/// version is not accepted at all. Absent versions read as the current line:
+/// the field postdates the earliest envelopes, and every live v0.1 emitter
+/// declares its version explicitly, so absence means a current emitter.
+pub fn schema_line(version: Option<&str>) -> Option<SchemaLine> {
+    match version {
+        None | Some("1.0") => Some(SchemaLine::V1_0),
+        Some("0.1") => Some(SchemaLine::V0_1),
+        Some(_) => None,
+    }
+}
 
 /// Conformance levels the standard defines (spec 5.7).
 pub const STANDARD_CONFORMANCE_LEVELS: &[&str] = &["retrieval", "grounding", "citation"];
@@ -110,10 +141,66 @@ pub fn normalise_event_data_enums(event_type: &str, data: &mut Value) -> Vec<Str
 /// are accepted and treated as the current version: the field postdates the
 /// earliest envelopes, so its absence carries no information.
 pub fn schema_version_accepted(version: Option<&str>) -> bool {
-    match version {
-        None => true,
-        Some(v) => ACCEPTED_SCHEMA_VERSIONS.contains(&v),
+    schema_line(version).is_some()
+}
+
+/// Apply the spec 12.1 migration rules for reading a v0.1 preview event as
+/// v1, in place, returning the names of the fields written:
+///
+/// - `content_cited` without `data.citation_type` reads as `unclassified`;
+/// - `content_grounded` without `data.scope` reads as `turn` when the event
+///   carries a `turn_id` and `session` otherwise;
+/// - a `data.bot_category` value is read as `purpose` (the v1 name for the
+///   field). The original member is kept so pre-rename readers still see
+///   it during the transition; the read layer coalesces the two.
+///
+/// Everything else the preview line tolerated stays tolerated: 12.1 defines
+/// no other defaulting rule, and inventing one would manufacture claims the
+/// emitter never made. Used both at ingest for documents declaring `"0.1"`
+/// and at materialisation for stored rows written before versioned ingest.
+pub fn apply_v0_migration(
+    event_type: &str,
+    turn_id: Option<&str>,
+    data: &mut Value,
+) -> Vec<String> {
+    let needs_default = matches!(event_type, "content_grounded" | "content_cited");
+    if data.is_null() && needs_default {
+        *data = Value::Object(serde_json::Map::new());
     }
+    let Some(obj) = data.as_object_mut() else {
+        return Vec::new();
+    };
+
+    let mut changed = Vec::new();
+    let absent = |obj: &serde_json::Map<String, Value>, field: &str| {
+        matches!(obj.get(field), None | Some(Value::Null))
+    };
+
+    match event_type {
+        "content_cited" if absent(obj, "citation_type") => {
+            obj.insert(
+                "citation_type".to_string(),
+                Value::String("unclassified".to_string()),
+            );
+            changed.push("citation_type".to_string());
+        }
+        "content_grounded" if absent(obj, "scope") => {
+            let scope = if turn_id.is_some() { "turn" } else { "session" };
+            obj.insert("scope".to_string(), Value::String(scope.to_string()));
+            changed.push("scope".to_string());
+        }
+        _ => {}
+    }
+
+    if let Some(Value::String(category)) = obj.get("bot_category")
+        && absent(obj, "purpose")
+    {
+        let category = category.clone();
+        obj.insert("purpose".to_string(), Value::String(category));
+        changed.push("purpose".to_string());
+    }
+
+    changed
 }
 
 /// Result of normalising an emitter-supplied conformance level.
@@ -403,11 +490,77 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_accepts_exact_minor_and_absent() {
+    fn schema_version_accepts_v1_and_transitional_v0() {
+        // "1.0" is the implemented version; absent reads as current.
         assert!(schema_version_accepted(None));
+        assert!(schema_version_accepted(Some("1.0")));
+        // "0.1" stays accepted during the transition: live member edge
+        // workers still declare it, and spec 12.1 defines how a consumer
+        // reads preview documents. This is deliberately more lenient than
+        // the spec's non-interoperation rule and is removed once every
+        // emitter declares "1.0".
         assert!(schema_version_accepted(Some("0.1")));
         assert!(!schema_version_accepted(Some("0.2")));
-        assert!(!schema_version_accepted(Some("1.0")));
+        assert!(!schema_version_accepted(Some("1.1")));
+        assert!(!schema_version_accepted(Some("2.0")));
+    }
+
+    #[test]
+    fn schema_line_maps_versions_to_strictness() {
+        assert_eq!(schema_line(None), Some(SchemaLine::V1_0));
+        assert_eq!(schema_line(Some("1.0")), Some(SchemaLine::V1_0));
+        assert_eq!(schema_line(Some("0.1")), Some(SchemaLine::V0_1));
+        assert_eq!(schema_line(Some("9.9")), None);
+    }
+
+    #[test]
+    fn v0_migration_defaults_citation_type_to_unclassified() {
+        let mut data = json!({ "excerpt_chars": 90 });
+        let changed = apply_v0_migration("content_cited", None, &mut data);
+        assert_eq!(changed, vec!["citation_type"]);
+        assert_eq!(data["citation_type"], "unclassified");
+        assert_eq!(data["excerpt_chars"], 90);
+
+        // A supplied value is never overwritten.
+        let mut data = json!({ "citation_type": "direct_quote" });
+        assert!(apply_v0_migration("content_cited", None, &mut data).is_empty());
+        assert_eq!(data["citation_type"], "direct_quote");
+    }
+
+    #[test]
+    fn v0_migration_defaults_grounding_scope_by_turn_presence() {
+        let mut data = json!({});
+        apply_v0_migration("content_grounded", Some("turn-1"), &mut data);
+        assert_eq!(data["scope"], "turn");
+
+        let mut data = json!({});
+        apply_v0_migration("content_grounded", None, &mut data);
+        assert_eq!(data["scope"], "session");
+
+        // A supplied scope is never overwritten.
+        let mut data = json!({ "scope": "session" });
+        assert!(apply_v0_migration("content_grounded", Some("turn-1"), &mut data).is_empty());
+        assert_eq!(data["scope"], "session");
+
+        // Null data still gains the required member.
+        let mut data = Value::Null;
+        apply_v0_migration("content_grounded", None, &mut data);
+        assert_eq!(data["scope"], "session");
+    }
+
+    #[test]
+    fn v0_migration_reads_bot_category_as_purpose() {
+        let mut data = json!({ "bot_category": "inference", "bot_name": "Claude-User" });
+        let changed = apply_v0_migration("content_retrieved", None, &mut data);
+        assert_eq!(changed, vec!["purpose"]);
+        assert_eq!(data["purpose"], "inference");
+        // The original member is kept for pre-rename readers.
+        assert_eq!(data["bot_category"], "inference");
+
+        // An explicit purpose wins over the legacy field.
+        let mut data = json!({ "bot_category": "training", "purpose": "search" });
+        assert!(apply_v0_migration("content_retrieved", None, &mut data).is_empty());
+        assert_eq!(data["purpose"], "search");
     }
 
     #[test]
