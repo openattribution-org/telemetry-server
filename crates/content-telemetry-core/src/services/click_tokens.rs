@@ -119,6 +119,20 @@ pub async fn resolve_session_id(pool: &PgPool, token: &str) -> Result<Option<Uui
 /// at every privacy level including `minimal` (spec 5.5) - so the manifest
 /// shape is valid at any privacy level the session declares.
 ///
+/// TODO(spec 7.4.4): this is still the v0.1 click-manifest shape. The v1
+/// click context replaces it with four components - the engagement, the
+/// clicked content's lineage by content identity, a contributing-source set
+/// scoped to the click's turn under the per-owner opt-in gate, and at most
+/// a count-based session summary. That narrowing is design work for a
+/// separate change; until then this resolver keeps the whole-session scope
+/// under the existing consent gates.
+///
+/// TODO(spec 7.3): events identified only by `content_id` are withheld
+/// because owner consent is resolved by domain alone. v1 makes the
+/// registered `content_id` prefix a co-primary owner-resolution path;
+/// implementing prefix registration and resolution belongs with the click
+/// context rebuild.
+///
 /// Returns None if the token doesn't exist or has expired.
 pub async fn lookup_by_token(
     pool: &PgPool,

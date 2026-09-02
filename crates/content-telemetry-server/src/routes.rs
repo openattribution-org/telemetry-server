@@ -534,15 +534,21 @@ async fn create_click_token(
     ))
 }
 
-/// Resolve a ctx token to its click manifest.
+/// Resolve a ctx token to its click context.
 ///
 /// Deliberately unauthenticated: the destination of a click-out has no
 /// account here, and requiring one would defeat the mechanism. The token is
 /// the credential, and what it discloses is bounded twice over — by
-/// two-sided consent inside the core lookup, and by the manifest shape, which
+/// two-sided consent inside the core lookup, and by the response shape, which
 /// never contains the session id. A missing token, an expired one and a
 /// non-consenting one are all 404, so the endpoint cannot be used to probe
 /// which sessions exist.
+///
+/// TODO(spec 7.4.4): the response is still the v0.1 click-manifest shape;
+/// the v1 four-component click context (engagement, clicked-content
+/// lineage, turn-scoped contributing sources, count-based session summary)
+/// is a separate design change — see the note on
+/// `click_tokens::lookup_by_token`.
 async fn lookup_ctx(
     State(state): State<AppState>,
     Path(token): Path<String>,
