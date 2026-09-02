@@ -414,6 +414,16 @@ async fn resolve_binding(
             )));
         }
 
+        // Well-formedness before lookup (spec 7.4.1): every token this
+        // server mints matches the pattern, so anything else can only be
+        // noise or probing and never reaches the database.
+        if !click_tokens::ctx_token_well_formed(token) {
+            return Err(ApiError::bad_request(format!(
+                "event {index}: malformed ctx_token; token values match \
+                 ^ct_[A-Za-z0-9_-]{{16,240}}$ (spec 7.4.1)"
+            )));
+        }
+
         let session_id = click_tokens::resolve_session_id(&state.pool, token)
             .await?
             .ok_or_else(|| {
@@ -491,6 +501,16 @@ async fn create_click_token(
     OrgContext(org): OrgContext,
     Json(req): Json<ClickTokenCreateRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // A caller-supplied token is held to the same spec 7.4.1 shape as a
+    // minted one; the unguessability of its suffix is the issuer's burden.
+    if let Some(token) = req.token.as_deref()
+        && !click_tokens::ctx_token_well_formed(token)
+    {
+        return Err(ApiError::bad_request(
+            "token must match ^ct_[A-Za-z0-9_-]{16,240}$ (spec 7.4.1)",
+        ));
+    }
+
     let session = sessions::find_owned_session(&state.pool, org, req.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;

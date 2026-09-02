@@ -10,16 +10,54 @@ use crate::models::click_token::{
 };
 use crate::models::event::EventRow;
 
+/// Whether a ctx token value satisfies the spec 7.4.1 pattern
+/// `^ct_[A-Za-z0-9_-]{16,240}$`. Applied at mint — including to
+/// caller-supplied overrides — and at ingest, so no other shape enters the
+/// system. The pattern is ASCII-only, so byte-wise checks are exact.
+pub fn ctx_token_well_formed(token: &str) -> bool {
+    let Some(suffix) = token.strip_prefix("ct_") else {
+        return false;
+    };
+    (16..=240).contains(&suffix.len())
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Mint a well-formed ctx token: `ct_` plus 32 bytes from the operating
+/// system's CSPRNG, base64url-encoded without padding. That is 256 bits of
+/// randomness against the spec's 96-bit floor (7.4.1): holding one token
+/// gives no way to derive or enumerate another, and the value encodes no
+/// content, session or user identifier.
+fn mint_ctx_token() -> String {
+    use base64::Engine as _;
+    use rand::RngCore as _;
+
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!(
+        "ct_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
 /// Create a click token mapping a click-out event to a session.
 ///
-/// If `token` is None, a random UUID-based token is generated.
+/// If `token` is None, a fresh `ct_`-prefixed token is minted from the
+/// system CSPRNG. Callers passing their own token are responsible for
+/// checking [`ctx_token_well_formed`] first (the HTTP layer does); the
+/// debug assertion catches library misuse.
 pub async fn create_click_token(
     pool: &PgPool,
     session_id: Uuid,
     content_url: &str,
     token: Option<&str>,
 ) -> Result<ClickTokenRow, sqlx::Error> {
-    let token_value = token.map_or_else(|| Uuid::new_v4().to_string(), String::from);
+    debug_assert!(
+        token.is_none_or(ctx_token_well_formed),
+        "caller-supplied ctx tokens must match ^ct_[A-Za-z0-9_-]{{16,240}}$"
+    );
+    let token_value = token.map_or_else(mint_ctx_token, String::from);
 
     sqlx::query_as::<_, ClickTokenRow>(
         "INSERT INTO click_tokens (token, session_id, content_url)
@@ -213,4 +251,43 @@ pub async fn cleanup_expired(pool: &PgPool) -> Result<u64, sqlx::Error> {
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minted_tokens_match_the_spec_pattern() {
+        for _ in 0..16 {
+            let token = mint_ctx_token();
+            assert!(ctx_token_well_formed(&token), "minted {token} malformed");
+            // 32 bytes base64url without padding is 43 characters.
+            assert_eq!(token.len(), "ct_".len() + 43);
+        }
+        // Distinct mints never collide in practice; two in a row certainly
+        // must not (a collision here means the RNG is broken).
+        assert_ne!(mint_ctx_token(), mint_ctx_token());
+    }
+
+    #[test]
+    fn well_formedness_follows_the_spec_grammar() {
+        assert!(ctx_token_well_formed("ct_0123456789abcdef"));
+        assert!(ctx_token_well_formed(&format!("ct_{}", "a".repeat(240))));
+
+        // Wrong or missing prefix.
+        assert!(!ctx_token_well_formed("cx_0123456789abcdef"));
+        assert!(!ctx_token_well_formed("0123456789abcdef"));
+        // Legacy UUID tokens are not well-formed.
+        assert!(!ctx_token_well_formed(
+            "d76318b8-4a06-4c48-8929-0c2f9b59d0c8"
+        ));
+        // Suffix length bounds: 16..=240.
+        assert!(!ctx_token_well_formed("ct_012345678901234"));
+        assert!(!ctx_token_well_formed(&format!("ct_{}", "a".repeat(241))));
+        // Characters outside [A-Za-z0-9_-].
+        assert!(!ctx_token_well_formed("ct_0123456789abcde!"));
+        assert!(!ctx_token_well_formed("ct_0123456789abcdé"));
+        assert!(!ctx_token_well_formed(""));
+    }
 }

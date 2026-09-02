@@ -11,6 +11,7 @@
 use chrono::{DateTime, Duration, Utc};
 use content_telemetry_core::conformance;
 use content_telemetry_core::models::event::TelemetryEventInput;
+use content_telemetry_core::services::click_tokens;
 
 use crate::error::ApiError;
 
@@ -149,6 +150,18 @@ pub fn check_event(
             event.turn.is_some(),
         ) {
             return Err(ApiError::bad_request(format!("event {index}: {violation}")));
+        }
+
+        // A recorded event-level ctx_token is a claim about a minted token
+        // (spec 7.4.1); a value outside the token grammar can never have
+        // been minted, so it is rejected rather than stored.
+        if let Some(token) = event.ctx_token.as_deref()
+            && !click_tokens::ctx_token_well_formed(token)
+        {
+            return Err(ApiError::bad_request(format!(
+                "event {index}: malformed ctx_token; token values match \
+                 ^ct_[A-Za-z0-9_-]{{16,240}}$ (spec 7.4.1)"
+            )));
         }
     }
 
