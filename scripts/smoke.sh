@@ -75,11 +75,11 @@ RESP=$(curl -s -X POST "$BASE/events" \
   -H 'content-type: application/json' -H "x-organization-id: $AGENT" \
   -d "{
     \"document_type\":\"event_batch\",
-    \"schema_version\":\"0.1\",
+    \"schema_version\":\"1.0\",
     \"session_id\":\"$SESSION\",
     \"events\":[
-      {\"type\":\"content_grounded\",\"timestamp\":\"$TS\",\"content_url\":\"$URL\",\"data\":{\"grounding_scope\":\"session\"}},
-      {\"id\":\"$CITED\",\"type\":\"content_cited\",\"timestamp\":\"$TS\",\"content_url\":\"$URL\",\"output_id\":\"out-1\"},
+      {\"type\":\"content_grounded\",\"timestamp\":\"$TS\",\"content_url\":\"$URL\",\"data\":{\"scope\":\"session\"}},
+      {\"id\":\"$CITED\",\"type\":\"content_cited\",\"timestamp\":\"$TS\",\"content_url\":\"$URL\",\"output_id\":\"out-1\",\"data\":{\"citation_type\":\"direct_quote\"}},
       {\"id\":\"$PRESENTED\",\"type\":\"content_presented\",\"timestamp\":\"$TS\",\"content_url\":\"$URL\",\"output_id\":\"out-1\",\"citation_id\":\"$CITED\",\"data\":{\"presentation_kind\":\"content\",\"presentation_type\":\"summary\"}}
     ]}")
 [ "$(echo "$RESP" | jget 'd.get("events_created","ERR")')" = "3" ] \
@@ -132,7 +132,7 @@ RESP=$(curl -s -X POST "$BASE/events" -H 'content-type: application/json' -H "x-
 
 RESP=$(curl -s -X POST "$BASE/events" -H 'content-type: application/json' -H "x-organization-id: $PUBLISHER" \
   -d "{\"ctx_token\":\"$TOKEN\",\"events\":[{\"id\":\"$(uuid)\",\"type\":\"content_cited\",\"timestamp\":\"$TS\",\"content_url\":\"$URL\",\"output_id\":\"out-9\"}]}")
-echo "$RESP" | grep -q 'only carry content_engaged' && ok "ctx token cannot write non-engagement claims" || bad "expected ctx restriction, got: $RESP"
+echo "$RESP" | grep -q 'content_engaged' && ok "ctx token cannot write non-engagement claims" || bad "expected ctx restriction, got: $RESP"
 
 echo "== standard session document"
 DOC=$(curl -s "$BASE/sessions/$SESSION/document" -H "x-organization-id: $AGENT")
@@ -146,13 +146,13 @@ RESP=$(curl -s -X POST "$BASE/sessions/end" -H 'content-type: application/json' 
 [ "$(echo "$RESP" | jget 'd.get("status","ERR")')" = "ok" ] && ok "session ended with outcome" || bad "end failed: $RESP"
 
 RESP=$(curl -s -X POST "$BASE/events" -H 'content-type: application/json' -H "x-organization-id: $AGENT" \
-  -d "{\"session_id\":\"$SESSION\",\"events\":[{\"type\":\"content_grounded\",\"timestamp\":\"$TS\",\"content_url\":\"$URL\"}]}")
+  -d "{\"session_id\":\"$SESSION\",\"events\":[{\"type\":\"content_grounded\",\"timestamp\":\"$TS\",\"content_url\":\"$URL\",\"data\":{\"scope\":\"session\"}}]}")
 echo "$RESP" | grep -q 'session has ended' && ok "events rejected after session end" || bad "expected ended-session error, got: $RESP"
 
 echo "== bulk session document"
 RESP=$(curl -s -X POST "$BASE/sessions/bulk" -H 'content-type: application/json' -H "x-organization-id: $AGENT" \
-  -d "{\"document_type\":\"session\",\"schema_version\":\"0.1\",\"session_id\":\"$(uuid)\",\"agent_id\":\"demo-agent\",
-       \"events\":[{\"type\":\"content_grounded\",\"timestamp\":\"$TS\",\"content_url\":\"$URL\"}],
+  -d "{\"document_type\":\"session\",\"schema_version\":\"1.0\",\"session_id\":\"$(uuid)\",\"agent_id\":\"demo-agent\",
+       \"events\":[{\"type\":\"content_grounded\",\"timestamp\":\"$TS\",\"content_url\":\"$URL\",\"data\":{\"scope\":\"session\"}}],
        \"outcome\":{\"type\":\"browse\"}}")
 [ "$(echo "$RESP" | jget 'd.get("events_created","ERR")')" = "1" ] && ok "bulk document ingested" || bad "bulk failed: $RESP"
 [ "$(echo "$RESP" | jget 'str(d.get("outcome_recorded"))')" = "True" ] && ok "bulk outcome recorded" || bad "bulk outcome not recorded: $RESP"

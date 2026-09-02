@@ -51,7 +51,7 @@
     {
       "id": "grounding_scope",
       "kind": "field_coverage",
-      "spec_ref": "standard s5.7.2",
+      "spec_ref": "standard s6.4",
       "data_field": "scope",
       "applies_to": ["content_grounded"],
       "description": "content_grounded events carry data.scope."
@@ -59,7 +59,7 @@
     {
       "id": "citation_type",
       "kind": "field_coverage",
-      "spec_ref": "standard s5.7.3",
+      "spec_ref": "standard s6.5",
       "data_field": "citation_type",
       "applies_to": ["content_cited"],
       "description": "content_cited events carry data.citation_type."

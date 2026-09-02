@@ -15,8 +15,10 @@ repository = "https://github.com/openattribution-org/telemetry-server"
 content-telemetry-core = { path = "crates/content-telemetry-core" }
 
 axum = "0.8"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
+rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", features = [

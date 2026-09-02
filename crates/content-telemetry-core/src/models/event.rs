@@ -20,18 +20,21 @@ pub struct TelemetryEventInput {
     pub content_telemetry_id: Option<Uuid>,
     pub content_url: Option<String>,
     pub content_id: Option<String>,
-    /// Output-artifact identity (spec 5.2): required on content_reproduced,
-    /// content_cited and content_presented events.
+    /// Output-artifact identity (spec 5.2): required on content_cited and
+    /// content_presented events.
     pub output_id: Option<String>,
     pub output_element_id: Option<String>,
-    /// On content_presented or content_reproduced, the id of the associated
-    /// content_cited event; absent for uncited presentations and uncredited
-    /// reproductions.
+    /// On content_presented, the id of the associated content_cited event;
+    /// absent for uncited presentations.
     pub citation_id: Option<Uuid>,
     /// On content_engaged, the id of the exact content_presented event the
     /// action occurred on. Required (spec 6.8).
     pub presentation_id: Option<Uuid>,
     pub license_ref: Option<String>,
+    /// Reference to the governing terms the emitter associates with this
+    /// event (spec 5.2.4). Opaque: stored and served byte-for-byte, never
+    /// resolved, validated or rewritten.
+    pub terms_ref: Option<String>,
     pub product_id: Option<Uuid>,
     pub turn: Option<serde_json::Value>,
     #[serde(default)]
@@ -106,7 +109,13 @@ pub struct EventRow {
     pub output_element_id: Option<String>,
     pub citation_id: Option<Uuid>,
     pub presentation_id: Option<Uuid>,
+    /// On content_engaged, the click token minted for this engagement's
+    /// presentation (spec 5.2, 7.4.1), recorded so destination reports can
+    /// be joined to it.
+    pub ctx_token: Option<String>,
     pub license_ref: Option<String>,
+    /// Governing-terms reference (spec 5.2.4), preserved byte-for-byte.
+    pub terms_ref: Option<String>,
     pub product_id: Option<Uuid>,
     pub turn_data: Option<serde_json::Value>,
     pub event_data: serde_json::Value,

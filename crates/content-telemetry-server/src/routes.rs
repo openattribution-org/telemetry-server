@@ -139,9 +139,9 @@ async fn bulk_session(
         ));
     }
 
-    if !conformance::schema_version_accepted(req.schema_version.as_deref()) {
+    let Some(line) = conformance::schema_line(req.schema_version.as_deref()) else {
         return Err(unsupported_schema_version(req.schema_version.as_deref()));
-    }
+    };
 
     check_initiator_type(&req.initiator_type)?;
     if let Some(outcome) = req.outcome.as_ref() {
@@ -154,8 +154,10 @@ async fn bulk_session(
 
     let mut events_in = req.events;
     for (index, event) in events_in.iter_mut().enumerate() {
-        validate::check_event(event, state.max_event_age_days, index)?;
-        log_notes(validate::normalise(event));
+        // Normalise before checking: a "0.1" document's migration defaults
+        // (spec 12.1) must land before the structural rules judge it.
+        log_notes(validate::normalise(event, line));
+        validate::check_event(event, line, state.max_event_age_days, index)?;
     }
 
     let level = conformance::normalise_conformance_level(req.conformance_level.as_deref());
@@ -274,9 +276,9 @@ async fn record_events(
         ));
     }
 
-    if !conformance::schema_version_accepted(req.schema_version.as_deref()) {
+    let Some(line) = conformance::schema_line(req.schema_version.as_deref()) else {
         return Err(unsupported_schema_version(req.schema_version.as_deref()));
-    }
+    };
 
     // Both envelopes are accepted: `event` for a single standalone event,
     // `events` for a batch (specification section 7.1).
@@ -295,6 +297,21 @@ async fn record_events(
         return Err(too_large(incoming.len()));
     }
 
+    // An envelope ctx_token accompanies content_engaged events only (spec
+    // 5.7.5). Checked here, not during binding: a batch that also presents
+    // a session_id binds through the session, but presenting the token
+    // alongside non-engagement claims is still malformed.
+    if req.ctx_token.is_some()
+        && let Some(index) = incoming
+            .iter()
+            .position(|e| e.event_type != "content_engaged")
+    {
+        return Err(ApiError::bad_request(format!(
+            "event {index}: an envelope ctx_token may only accompany content_engaged events; \
+             supply a session_id instead"
+        )));
+    }
+
     let batch_session = req
         .session_id
         .as_deref()
@@ -302,8 +319,10 @@ async fn record_events(
     let batch_session = batch_session.transpose()?;
 
     for (index, event) in incoming.iter_mut().enumerate() {
-        validate::check_event(event, state.max_event_age_days, index)?;
-        log_notes(validate::normalise(event));
+        // Normalise before checking: a "0.1" document's migration defaults
+        // (spec 12.1) must land before the structural rules judge it.
+        log_notes(validate::normalise(event, line));
+        validate::check_event(event, line, state.max_event_age_days, index)?;
     }
 
     let defaults = BatchDefaults {
@@ -395,6 +414,16 @@ async fn resolve_binding(
             )));
         }
 
+        // Well-formedness before lookup (spec 7.4.1): every token this
+        // server mints matches the pattern, so anything else can only be
+        // noise or probing and never reaches the database.
+        if !click_tokens::ctx_token_well_formed(token) {
+            return Err(ApiError::bad_request(format!(
+                "event {index}: malformed ctx_token; token values match \
+                 ^ct_[A-Za-z0-9_-]{{16,240}}$ (spec 7.4.1)"
+            )));
+        }
+
         let session_id = click_tokens::resolve_session_id(&state.pool, token)
             .await?
             .ok_or_else(|| {
@@ -472,6 +501,16 @@ async fn create_click_token(
     OrgContext(org): OrgContext,
     Json(req): Json<ClickTokenCreateRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // A caller-supplied token is held to the same spec 7.4.1 shape as a
+    // minted one; the unguessability of its suffix is the issuer's burden.
+    if let Some(token) = req.token.as_deref()
+        && !click_tokens::ctx_token_well_formed(token)
+    {
+        return Err(ApiError::bad_request(
+            "token must match ^ct_[A-Za-z0-9_-]{16,240}$ (spec 7.4.1)",
+        ));
+    }
+
     let session = sessions::find_owned_session(&state.pool, org, req.session_id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -495,15 +534,21 @@ async fn create_click_token(
     ))
 }
 
-/// Resolve a ctx token to its click manifest.
+/// Resolve a ctx token to its click context.
 ///
 /// Deliberately unauthenticated: the destination of a click-out has no
 /// account here, and requiring one would defeat the mechanism. The token is
 /// the credential, and what it discloses is bounded twice over — by
-/// two-sided consent inside the core lookup, and by the manifest shape, which
+/// two-sided consent inside the core lookup, and by the response shape, which
 /// never contains the session id. A missing token, an expired one and a
 /// non-consenting one are all 404, so the endpoint cannot be used to probe
 /// which sessions exist.
+///
+/// TODO(spec 7.4.4): the response is still the v0.1 click-manifest shape;
+/// the v1 four-component click context (engagement, clicked-content
+/// lineage, turn-scoped contributing sources, count-based session summary)
+/// is a separate design change — see the note on
+/// `click_tokens::lookup_by_token`.
 async fn lookup_ctx(
     State(state): State<AppState>,
     Path(token): Path<String>,

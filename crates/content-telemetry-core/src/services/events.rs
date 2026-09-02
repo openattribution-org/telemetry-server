@@ -78,7 +78,9 @@ pub async fn create_events_with_context(
     let mut output_element_ids: Vec<Option<String>> = Vec::with_capacity(len);
     let mut citation_ids: Vec<Option<Uuid>> = Vec::with_capacity(len);
     let mut presentation_ids: Vec<Option<Uuid>> = Vec::with_capacity(len);
+    let mut ctx_tokens: Vec<Option<String>> = Vec::with_capacity(len);
     let mut license_refs: Vec<Option<String>> = Vec::with_capacity(len);
+    let mut terms_refs: Vec<Option<String>> = Vec::with_capacity(len);
     let mut product_ids: Vec<Option<Uuid>> = Vec::with_capacity(len);
     let mut turn_datas: Vec<Option<serde_json::Value>> = Vec::with_capacity(len);
     let mut event_datas = Vec::with_capacity(len);
@@ -98,7 +100,12 @@ pub async fn create_events_with_context(
         output_element_ids.push(event.event.output_element_id.clone());
         citation_ids.push(event.event.citation_id);
         presentation_ids.push(event.event.presentation_id);
+        ctx_tokens.push(event.event.ctx_token.clone());
         license_refs.push(event.event.license_ref.clone());
+        // terms_ref is preserved byte-for-byte (spec 5.2.4): a processor
+        // MUST NOT rewrite it, so it is cloned and bound with no
+        // normalisation of any kind.
+        terms_refs.push(event.event.terms_ref.clone());
         product_ids.push(event.event.product_id);
         // A consumer that receives a privacy-violating turn strips the
         // offending fields rather than rejecting the document (spec 5.7.5).
@@ -124,14 +131,14 @@ pub async fn create_events_with_context(
         r"INSERT INTO events (
             id, session_id, organization_id, event_type, source_role, content_telemetry_id,
             content_url, content_id, turn_id,
-            output_id, output_element_id, citation_id, presentation_id, license_ref,
-            product_id, turn_data, event_data, event_timestamp
+            output_id, output_element_id, citation_id, presentation_id, ctx_token, license_ref,
+            terms_ref, product_id, turn_data, event_data, event_timestamp
         )
         SELECT * FROM UNNEST(
             $1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::text[], $6::uuid[],
             $7::text[], $8::text[], $9::text[],
-            $10::text[], $11::text[], $12::uuid[], $13::uuid[], $14::text[],
-            $15::uuid[], $16::jsonb[], $17::jsonb[], $18::timestamptz[]
+            $10::text[], $11::text[], $12::uuid[], $13::uuid[], $14::text[], $15::text[],
+            $16::text[], $17::uuid[], $18::jsonb[], $19::jsonb[], $20::timestamptz[]
         )
         ON CONFLICT (id) DO NOTHING
         RETURNING *",
@@ -149,7 +156,9 @@ pub async fn create_events_with_context(
     .bind(&output_element_ids)
     .bind(&citation_ids)
     .bind(&presentation_ids)
+    .bind(&ctx_tokens)
     .bind(&license_refs)
+    .bind(&terms_refs)
     .bind(&product_ids)
     .bind(&turn_datas)
     .bind(&event_datas)

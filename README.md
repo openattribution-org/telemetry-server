@@ -52,13 +52,13 @@ curl -s -X POST localhost:8080/events \
   -H 'content-type: application/json' -H "x-organization-id: $ORG" \
   -d '{
     "document_type": "event_batch",
-    "schema_version": "0.1",
+    "schema_version": "1.0",
     "session_id": "'"$SESSION"'",
     "events": [
       {"type": "content_grounded",
        "timestamp": "2026-08-06T12:00:00Z",
        "content_url": "https://example.com/article-1",
-       "data": {"grounding_scope": "session"}}
+       "data": {"scope": "session"}}
     ]}'
 
 curl -s "localhost:8080/sessions/$SESSION/document" -H "x-organization-id: $ORG"
@@ -78,7 +78,7 @@ disclosure and document materialisation — against a live build.
 | `GET` | `/sessions/{id}/document` | The session as a standard session document |
 | `POST` | `/events` | Ingest events, singly or in batches of up to 500 |
 | `POST` | `/click-tokens` | Mint a ctx token for a click-out |
-| `GET` | `/ctx/{token}` | Resolve a ctx token to its click manifest |
+| `GET` | `/ctx/{token}` | Resolve a ctx token to its click context |
 
 Events bind to a session in this order: the event's own `session_id`, the
 batch's, the event's `ctx_token`, the batch's, and otherwise nothing —
@@ -103,8 +103,8 @@ No handler changes, because no handler knows how the answer was reached.
 
 The exception is `GET /ctx/{token}`, deliberately unauthenticated: the
 destination of a click-out has no account here. The token is the credential,
-and what it discloses is bounded by two-sided consent and by a manifest shape
-that never contains the session id.
+and what it discloses is bounded by two-sided consent and by a click-context
+shape that never contains the session id.
 
 ## The database
 
@@ -123,12 +123,19 @@ others.
 
 ## Conformance
 
-Ingest enforces the v1 structural rules: `content_cited`, `content_presented`
-and `content_reproduced` carry an event id and an `output_id`;
-`content_engaged` carries the `presentation_id` of the presentation it acted
-on; content events carry a resolvable `content_url` or `content_id`. The
-`content_displayed` type v1 withdrew is refused rather than rewritten into a
-claim the emitter never made.
+Ingest enforces the v1 structural rules on documents declaring
+`schema_version` `"1.0"`: `content_cited` and `content_presented` carry an
+event id and an `output_id`; `content_grounded` carries `data.scope`;
+`content_cited` carries `data.citation_type`; `content_retrieved` carries
+`source_role`; `content_engaged` carries the `presentation_id` of the
+presentation it acted on; content events carry a resolvable `content_url` or
+`content_id`. Documents still declaring `"0.1"` are accepted for the
+transition and normalised under the specification's migration rules instead.
+The `content_displayed` type v1 withdrew is refused rather than rewritten
+into a claim the emitter never made. `content_reproduced`, which never made
+it out of the pre-release draft, is no longer a core type: rows stored under
+it are treated like any other extension event and quarantined under the
+document's `extensions` member.
 
 Two things are stored as given rather than validated, because the
 specification says a consumer must not reject a document over either:
