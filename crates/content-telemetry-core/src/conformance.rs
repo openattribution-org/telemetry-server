@@ -50,7 +50,6 @@ pub const STANDARD_CONFORMANCE_LEVELS: &[&str] = &["retrieval", "grounding", "ci
 pub const CONTENT_EVENT_TYPES: &[&str] = &[
     "content_retrieved",
     "content_grounded",
-    "content_reproduced",
     "content_cited",
     "content_presented",
     "content_engaged",
@@ -69,12 +68,14 @@ pub const CITATION_TYPES: &[&str] = &[
 ];
 pub const CITATION_POSITIONS: &[&str] = &["primary", "supporting", "mentioned", "unclassified"];
 pub const GROUNDING_SCOPES: &[&str] = &["session", "turn"];
-pub const REPRODUCTION_TYPES: &[&str] = &["verbatim", "near_verbatim", "unclassified"];
 pub const PRESENTATION_KINDS: &[&str] = &["content", "source_reference"];
 
 /// The event type v1 withdrew (spec 12.1). Emitters MUST NOT send it on the
 /// v1 integration line; stored v0.1 rows keep it and are quarantined under
-/// `extensions.events` at materialisation.
+/// `extensions.events` at materialisation. `content_reproduced`, the other
+/// type 12.1 excludes, existed only on the pre-release v1-draft line: it is
+/// simply not in the core sets here, so stored draft rows self-quarantine
+/// the same way without a named constant.
 pub const WITHDRAWN_EVENT_TYPE_DISPLAYED: &str = "content_displayed";
 
 /// V0.1 event `data` fields prohibited by the v1 migration rule (spec 9.1).
@@ -103,11 +104,6 @@ pub fn normalise_event_data_enums(event_type: &str, data: &mut Value) -> Vec<Str
             ("citation_type", CITATION_TYPES, Some("unclassified")),
             ("position", CITATION_POSITIONS, Some("unclassified")),
         ],
-        "content_reproduced" => &[(
-            "reproduction_type",
-            REPRODUCTION_TYPES,
-            Some("unclassified"),
-        )],
         _ => return Vec::new(),
     };
 
@@ -265,12 +261,12 @@ pub fn strip_withdrawn_data_fields(data: &mut Value) -> Vec<String> {
 }
 
 /// The v1 structural requirements the standard's JSON Schema enforces per
-/// event type (spec 5.2, 6.5-6.8): reproduction, citation and presentation
-/// events carry an emitter-assigned `id` and an `output_id`; reproduction
-/// and citation carry a resolvable source reference; reproduction carries
-/// `data.reproduction_type`; presentation carries `data.presentation_kind`
-/// (closed) and `data.presentation_type`; engagement carries the
-/// `presentation_id` of the exact presentation occurrence acted upon.
+/// event type (spec 5.2, 6.5-6.8): citation and presentation events carry
+/// an emitter-assigned `id` and an `output_id`; citation carries a
+/// resolvable source reference; presentation carries
+/// `data.presentation_kind` (closed) and `data.presentation_type`;
+/// engagement carries the `presentation_id` of the exact presentation
+/// occurrence acted upon.
 ///
 /// Returns a description of the first violation, or None when the event
 /// satisfies the v1 shape. Ingest rejects violations; materialisation uses
@@ -289,47 +285,35 @@ pub fn v1_structural_violation(
     let data_str = |field: &str| -> Option<&str> { data.get(field).and_then(Value::as_str) };
 
     match event_type {
-        "content_reproduced" | "content_cited" | "content_presented" => {
+        "content_cited" | "content_presented" => {
             if !id_present {
                 return Some(format!("{event_type} events must carry an event id"));
             }
             if !output_id.is_some_and(|v| !v.is_empty()) {
                 return Some(format!("{event_type} events must carry output_id"));
             }
-            match event_type {
-                "content_reproduced" | "content_cited" => {
-                    // Schema-enforced for these two types (spec 6.5, 6.6),
-                    // over and above the application-layer identifier rule.
-                    if !(content_url.is_some_and(|v| !v.is_empty())
-                        || content_id.is_some_and(|v| !v.is_empty()))
-                    {
-                        return Some(format!(
-                            "{event_type} events must carry a resolvable content_url or content_id"
-                        ));
-                    }
-                    if event_type == "content_reproduced"
-                        && !data_str("reproduction_type").is_some_and(|v| !v.is_empty())
-                    {
-                        return Some(
-                            "content_reproduced events must carry data.reproduction_type"
-                                .to_string(),
-                        );
-                    }
+            if event_type == "content_cited" {
+                // Schema-enforced for citations (spec 6.5), over and above
+                // the application-layer identifier rule.
+                if !(content_url.is_some_and(|v| !v.is_empty())
+                    || content_id.is_some_and(|v| !v.is_empty()))
+                {
+                    return Some(format!(
+                        "{event_type} events must carry a resolvable content_url or content_id"
+                    ));
                 }
-                _ => {
-                    let kind = data_str("presentation_kind");
-                    if !kind.is_some_and(|v| PRESENTATION_KINDS.contains(&v)) {
-                        return Some(format!(
-                            "content_presented events must carry data.presentation_kind of: {}",
-                            PRESENTATION_KINDS.join(", ")
-                        ));
-                    }
-                    if !data_str("presentation_type").is_some_and(|v| !v.is_empty()) {
-                        return Some(
-                            "content_presented events must carry data.presentation_type"
-                                .to_string(),
-                        );
-                    }
+            } else {
+                let kind = data_str("presentation_kind");
+                if !kind.is_some_and(|v| PRESENTATION_KINDS.contains(&v)) {
+                    return Some(format!(
+                        "content_presented events must carry data.presentation_kind of: {}",
+                        PRESENTATION_KINDS.join(", ")
+                    ));
+                }
+                if !data_str("presentation_type").is_some_and(|v| !v.is_empty()) {
+                    return Some(
+                        "content_presented events must carry data.presentation_type".to_string(),
+                    );
                 }
             }
             None
@@ -445,12 +429,7 @@ mod tests {
     fn media_type_is_an_open_vocabulary() {
         // media_type tolerates emitter-defined values beyond the core set
         // (spec Annex A): unknown values pass through untouched.
-        for event_type in [
-            "content_retrieved",
-            "content_grounded",
-            "content_reproduced",
-            "content_cited",
-        ] {
+        for event_type in ["content_retrieved", "content_grounded", "content_cited"] {
             let mut data = json!({ "media_type": "dataset" });
             assert!(
                 normalise_event_data_enums(event_type, &mut data).is_empty(),
@@ -587,12 +566,18 @@ mod tests {
     }
 
     #[test]
-    fn reproduction_type_normalises_to_unclassified() {
-        let mut data = json!({ "reproduction_type": "loose_paraphrase", "reproduced_chars": 90 });
-        let changed = normalise_event_data_enums("content_reproduced", &mut data);
-        assert_eq!(changed, vec!["reproduction_type"]);
-        assert_eq!(data["reproduction_type"], "unclassified");
-        assert_eq!(data["reproduced_chars"], 90);
+    fn withdrawn_reproduced_type_carries_no_rules() {
+        // content_reproduced existed only on the pre-release v1-draft line
+        // (spec 12.1). It is an extension type now: no enum normalisation
+        // applies, and no v1 structural requirement recognises it.
+        let mut data = json!({ "reproduction_type": "loose_paraphrase" });
+        assert!(normalise_event_data_enums("content_reproduced", &mut data).is_empty());
+        assert_eq!(data["reproduction_type"], "loose_paraphrase");
+        assert!(!CONTENT_EVENT_TYPES.contains(&"content_reproduced"));
+        assert!(
+            v1_structural_violation("content_reproduced", false, None, false, None, None, &data)
+                .is_none()
+        );
     }
 
     #[test]
@@ -611,13 +596,12 @@ mod tests {
 
     #[test]
     fn v1_structure_requires_output_identity_on_response_layer_events() {
-        for event_type in ["content_reproduced", "content_cited", "content_presented"] {
+        for event_type in ["content_cited", "content_presented"] {
             let data = match event_type {
-                "content_reproduced" => json!({ "reproduction_type": "verbatim" }),
                 "content_presented" => {
                     json!({ "presentation_kind": "source_reference", "presentation_type": "link" })
                 }
-                _ => json!({}),
+                _ => json!({ "citation_type": "direct_quote" }),
             };
             assert!(
                 v1_structural_violation(
@@ -662,39 +646,25 @@ mod tests {
     }
 
     #[test]
-    fn v1_structure_requires_source_reference_on_reproduced_and_cited() {
-        for event_type in ["content_reproduced", "content_cited"] {
-            let data = json!({ "reproduction_type": "verbatim" });
-            assert!(
-                v1_structural_violation(
-                    event_type,
-                    true,
-                    Some("response:1"),
-                    false,
-                    None,
-                    None,
-                    &data
-                )
-                .is_some(),
-                "{event_type} accepted an event with no source reference"
-            );
-        }
-    }
-
-    #[test]
-    fn v1_structure_requires_typed_reproduction_and_presentation_data() {
+    fn v1_structure_requires_source_reference_on_cited() {
+        let data = json!({ "citation_type": "direct_quote" });
         assert!(
             v1_structural_violation(
-                "content_reproduced",
+                "content_cited",
                 true,
                 Some("response:1"),
                 false,
-                Some("https://example.com/a"),
                 None,
-                &json!({})
+                None,
+                &data
             )
-            .is_some()
+            .is_some(),
+            "content_cited accepted an event with no source reference"
         );
+    }
+
+    #[test]
+    fn v1_structure_requires_typed_presentation_data() {
         // presentation_kind is closed with no fallback member, so an
         // out-of-set value is a violation, not a normalisation case.
         assert!(

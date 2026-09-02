@@ -19,11 +19,13 @@ use crate::models::session::SessionWithEvents;
 /// extension event and moves to the document's `extensions` member -
 /// including `content_displayed`, which v1 withdrew (spec 12.1): stored
 /// v0.1 rows keep their type and are quarantined rather than rewritten
-/// into presentation claims the emitter never made.
+/// into presentation claims the emitter never made. The same applies to
+/// `content_reproduced`, which existed only on the pre-release v1-draft
+/// line and is not part of v1 (spec 12.1): stored draft rows self-
+/// quarantine here rather than being rewritten.
 const CORE_EVENT_TYPES: &[&str] = &[
     "content_retrieved",
     "content_grounded",
-    "content_reproduced",
     "content_cited",
     "content_presented",
     "content_engaged",
@@ -271,4 +273,145 @@ pub fn standard_document(swe: &SessionWithEvents) -> Value {
     doc.insert("extensions".to_string(), Value::Object(extensions));
 
     Value::Object(doc)
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::models::session::SessionRow;
+
+    fn session_row() -> SessionRow {
+        SessionRow {
+            id: Uuid::new_v4(),
+            organization_id: Uuid::new_v4(),
+            parent_session_id: None,
+            initiator_type: "user".to_string(),
+            initiator: None,
+            content_scope: None,
+            manifest_ref: None,
+            conformance_level: Some("citation".to_string()),
+            config_snapshot_hash: None,
+            agent_id: Some("test-agent".to_string()),
+            external_session_id: None,
+            prior_session_ids: None,
+            user_context: json!({}),
+            platform_id: None,
+            client_type: None,
+            client_info: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            outcome_type: None,
+            outcome_value: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn event_row(event_type: &str, data: Value) -> EventRow {
+        EventRow {
+            id: Uuid::new_v4(),
+            session_id: None,
+            organization_id: Uuid::new_v4(),
+            event_type: event_type.to_string(),
+            source_role: Some("agent".to_string()),
+            content_telemetry_id: None,
+            content_url: Some("https://example.com/a".to_string()),
+            content_id: None,
+            turn_id: None,
+            output_id: None,
+            output_element_id: None,
+            citation_id: None,
+            presentation_id: None,
+            license_ref: None,
+            product_id: None,
+            turn_data: None,
+            event_data: data,
+            event_timestamp: Utc::now(),
+            created_at: Utc::now(),
+        }
+    }
+
+    fn event_types(doc: &Value, pointer: &str) -> Vec<String> {
+        doc.pointer(pointer)
+            .and_then(Value::as_array)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter_map(|e| e.get("type").and_then(Value::as_str))
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn withdrawn_types_self_quarantine_into_extensions() {
+        // A stored pre-release content_reproduced row and a stored v0.1
+        // content_displayed row both fall outside CORE_EVENT_TYPES, so the
+        // partition moves them under extensions.events untouched (spec 12.1)
+        // while conforming core rows stay in the document body.
+        let swe = SessionWithEvents {
+            session: session_row(),
+            events: vec![
+                event_row("content_grounded", json!({ "scope": "session" })),
+                event_row(
+                    "content_reproduced",
+                    json!({ "reproduction_type": "verbatim", "output_id": "out-1" }),
+                ),
+                event_row("content_displayed", json!({ "display_type": "link" })),
+                event_row("checkout_completed", json!({})),
+            ],
+        };
+
+        let doc = standard_document(&swe);
+        assert_eq!(doc["schema_version"], "1.0");
+        assert_eq!(event_types(&doc, "/events"), vec!["content_grounded"]);
+
+        let quarantined = event_types(&doc, "/extensions/events");
+        assert_eq!(
+            quarantined,
+            vec![
+                "content_reproduced",
+                "content_displayed",
+                "checkout_completed"
+            ]
+        );
+
+        // Quarantined rows keep the claims their emitters made.
+        let reproduced = &doc["extensions"]["events"][0];
+        assert_eq!(reproduced["data"]["reproduction_type"], "verbatim");
+    }
+
+    #[test]
+    fn stored_v0_rows_materialise_under_the_migration_rules() {
+        // Rows written before versioned ingest lack the members v1 requires;
+        // the spec 12.1 defaults are applied on read so the document body
+        // keeps them rather than quarantining history (and the "1.0" stamp
+        // stays truthful).
+        let mut cited = event_row("content_cited", json!({}));
+        cited.output_id = Some("response:1".to_string());
+        let mut grounded_turn = event_row("content_grounded", json!({}));
+        grounded_turn.turn_id = Some("turn-1".to_string());
+
+        let swe = SessionWithEvents {
+            session: session_row(),
+            events: vec![
+                event_row("content_grounded", json!({})),
+                grounded_turn,
+                cited,
+            ],
+        };
+
+        let doc = standard_document(&swe);
+        assert_eq!(
+            event_types(&doc, "/events"),
+            vec!["content_grounded", "content_grounded", "content_cited"]
+        );
+        assert_eq!(doc["events"][0]["data"]["scope"], "session");
+        assert_eq!(doc["events"][1]["data"]["scope"], "turn");
+        assert_eq!(doc["events"][2]["data"]["citation_type"], "unclassified");
+    }
 }

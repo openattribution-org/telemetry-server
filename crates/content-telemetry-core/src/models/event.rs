@@ -20,13 +20,12 @@ pub struct TelemetryEventInput {
     pub content_telemetry_id: Option<Uuid>,
     pub content_url: Option<String>,
     pub content_id: Option<String>,
-    /// Output-artifact identity (spec 5.2): required on content_reproduced,
-    /// content_cited and content_presented events.
+    /// Output-artifact identity (spec 5.2): required on content_cited and
+    /// content_presented events.
     pub output_id: Option<String>,
     pub output_element_id: Option<String>,
-    /// On content_presented or content_reproduced, the id of the associated
-    /// content_cited event; absent for uncited presentations and uncredited
-    /// reproductions.
+    /// On content_presented, the id of the associated content_cited event;
+    /// absent for uncited presentations.
     pub citation_id: Option<Uuid>,
     /// On content_engaged, the id of the exact content_presented event the
     /// action occurred on. Required (spec 6.8).

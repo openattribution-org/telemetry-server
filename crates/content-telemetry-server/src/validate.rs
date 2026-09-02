@@ -81,12 +81,12 @@ pub fn check_event(
 
     // v1 withdrew content_displayed (specification section 12.1). Stored v0.1
     // rows keep their type, but nothing new is accepted under it: the
-    // replacement types distinguish presenting content from presenting a
-    // reference to it, and rewriting one into the other would manufacture a
-    // claim the emitter never made.
+    // replacement type distinguishes presenting content from presenting a
+    // reference to it via data.presentation_kind, and rewriting one into the
+    // other would manufacture a claim the emitter never made.
     if event.event_type == conformance::WITHDRAWN_EVENT_TYPE_DISPLAYED {
         return Err(ApiError::bad_request(format!(
-            "event {index}: '{}' was withdrawn in v1 — use content_presented or content_reproduced",
+            "event {index}: '{}' was withdrawn in v1 — use content_presented",
             conformance::WITHDRAWN_EVENT_TYPE_DISPLAYED
         )));
     }
