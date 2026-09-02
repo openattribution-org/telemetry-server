@@ -139,9 +139,9 @@ async fn bulk_session(
         ));
     }
 
-    if !conformance::schema_version_accepted(req.schema_version.as_deref()) {
+    let Some(line) = conformance::schema_line(req.schema_version.as_deref()) else {
         return Err(unsupported_schema_version(req.schema_version.as_deref()));
-    }
+    };
 
     check_initiator_type(&req.initiator_type)?;
     if let Some(outcome) = req.outcome.as_ref() {
@@ -154,8 +154,10 @@ async fn bulk_session(
 
     let mut events_in = req.events;
     for (index, event) in events_in.iter_mut().enumerate() {
-        validate::check_event(event, state.max_event_age_days, index)?;
-        log_notes(validate::normalise(event));
+        // Normalise before checking: a "0.1" document's migration defaults
+        // (spec 12.1) must land before the structural rules judge it.
+        log_notes(validate::normalise(event, line));
+        validate::check_event(event, line, state.max_event_age_days, index)?;
     }
 
     let level = conformance::normalise_conformance_level(req.conformance_level.as_deref());
@@ -274,9 +276,9 @@ async fn record_events(
         ));
     }
 
-    if !conformance::schema_version_accepted(req.schema_version.as_deref()) {
+    let Some(line) = conformance::schema_line(req.schema_version.as_deref()) else {
         return Err(unsupported_schema_version(req.schema_version.as_deref()));
-    }
+    };
 
     // Both envelopes are accepted: `event` for a single standalone event,
     // `events` for a batch (specification section 7.1).
@@ -295,6 +297,21 @@ async fn record_events(
         return Err(too_large(incoming.len()));
     }
 
+    // An envelope ctx_token accompanies content_engaged events only (spec
+    // 5.7.5). Checked here, not during binding: a batch that also presents
+    // a session_id binds through the session, but presenting the token
+    // alongside non-engagement claims is still malformed.
+    if req.ctx_token.is_some()
+        && let Some(index) = incoming
+            .iter()
+            .position(|e| e.event_type != "content_engaged")
+    {
+        return Err(ApiError::bad_request(format!(
+            "event {index}: an envelope ctx_token may only accompany content_engaged events; \
+             supply a session_id instead"
+        )));
+    }
+
     let batch_session = req
         .session_id
         .as_deref()
@@ -302,8 +319,10 @@ async fn record_events(
     let batch_session = batch_session.transpose()?;
 
     for (index, event) in incoming.iter_mut().enumerate() {
-        validate::check_event(event, state.max_event_age_days, index)?;
-        log_notes(validate::normalise(event));
+        // Normalise before checking: a "0.1" document's migration defaults
+        // (spec 12.1) must land before the structural rules judge it.
+        log_notes(validate::normalise(event, line));
+        validate::check_event(event, line, state.max_event_age_days, index)?;
     }
 
     let defaults = BatchDefaults {

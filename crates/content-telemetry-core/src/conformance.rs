@@ -242,11 +242,16 @@ pub fn content_identifier_present(
     content_url.is_some_and(|v| !v.is_empty()) || content_id.is_some_and(|v| !v.is_empty())
 }
 
-/// Strip the event `data` fields v1 withdrew (spec 9.1) in place, returning
-/// the names of the fields removed. A hashed IP address is a pseudonym, not
-/// an anonymous value, so `ip_hash` is treated as personal data: the
-/// consumer drops it rather than storing it, on ingest and again on read
-/// for rows written before this rule existed.
+/// Strip the event `data` fields v1 withdrew (spec 9.1, 12.1) in place,
+/// returning the names of the fields removed. A hashed IP address is a
+/// pseudonym, not an anonymous value, so `ip_hash` is treated as personal
+/// data: the consumer drops it rather than storing it, on ingest and again
+/// on read for rows written before this rule existed.
+///
+/// `content_fingerprint.preserved_in_output` is also withdrawn (spec 6.4,
+/// 12.1): v1 defines no output-side reuse reporting, and a grounding
+/// fingerprint is a grounding-time claim only. It lives one level down, so
+/// the top-level sweep cannot catch it.
 pub fn strip_withdrawn_data_fields(data: &mut Value) -> Vec<String> {
     let Some(obj) = data.as_object_mut() else {
         return Vec::new();
@@ -257,16 +262,24 @@ pub fn strip_withdrawn_data_fields(data: &mut Value) -> Vec<String> {
             stripped.push((*field).to_string());
         }
     }
+    if let Some(fingerprint) = obj
+        .get_mut("content_fingerprint")
+        .and_then(Value::as_object_mut)
+        && fingerprint.remove("preserved_in_output").is_some()
+    {
+        stripped.push("content_fingerprint.preserved_in_output".to_string());
+    }
     stripped
 }
 
 /// The v1 structural requirements the standard's JSON Schema enforces per
-/// event type (spec 5.2, 6.5-6.8): citation and presentation events carry
-/// an emitter-assigned `id` and an `output_id`; citation carries a
-/// resolvable source reference; presentation carries
-/// `data.presentation_kind` (closed) and `data.presentation_type`;
-/// engagement carries the `presentation_id` of the exact presentation
-/// occurrence acted upon.
+/// event type (spec 5.2, 6.4-6.8): grounding carries `data.scope` (closed)
+/// with `provenance` and `cached` kept consistent; citation and
+/// presentation events carry an emitter-assigned `id` and an `output_id`;
+/// citation carries a resolvable source reference and
+/// `data.citation_type`; presentation carries `data.presentation_kind`
+/// (closed) and `data.presentation_type`; engagement carries the
+/// `presentation_id` of the exact presentation occurrence acted upon.
 ///
 /// Returns a description of the first violation, or None when the event
 /// satisfies the v1 shape. Ingest rejects violations; materialisation uses
@@ -285,6 +298,31 @@ pub fn v1_structural_violation(
     let data_str = |field: &str| -> Option<&str> { data.get(field).and_then(Value::as_str) };
 
     match event_type {
+        "content_grounded" => {
+            // scope is required and schema-closed (spec 6.4): the occurrence
+            // boundary and every counting model depend on it.
+            if !data_str("scope").is_some_and(|v| GROUNDING_SCOPES.contains(&v)) {
+                return Some(format!(
+                    "content_grounded events must carry data.scope of: {}",
+                    GROUNDING_SCOPES.join(", ")
+                ));
+            }
+            // provenance and cached must agree (spec 6.4): agent_fetched
+            // asserts a live fetch this session, agent_cached asserts reuse.
+            // third_party_sourced leaves cached unconstrained.
+            let cached = data.get("cached").and_then(Value::as_bool);
+            match data_str("provenance") {
+                Some("agent_fetched") if cached != Some(false) => Some(
+                    "content_grounded provenance 'agent_fetched' requires data.cached: false"
+                        .to_string(),
+                ),
+                Some("agent_cached") if cached != Some(true) => Some(
+                    "content_grounded provenance 'agent_cached' requires data.cached: true"
+                        .to_string(),
+                ),
+                _ => None,
+            }
+        }
         "content_cited" | "content_presented" => {
             if !id_present {
                 return Some(format!("{event_type} events must carry an event id"));
@@ -301,6 +339,15 @@ pub fn v1_structural_violation(
                     return Some(format!(
                         "{event_type} events must carry a resolvable content_url or content_id"
                     ));
+                }
+                // citation_type is required and schema-enforced (spec 6.5);
+                // an emitter that cannot classify uses 'unclassified'.
+                if !data_str("citation_type").is_some_and(|v| !v.is_empty()) {
+                    return Some(
+                        "content_cited events must carry data.citation_type \
+                         ('unclassified' when the agent cannot classify)"
+                            .to_string(),
+                    );
                 }
             } else {
                 let kind = data_str("presentation_kind");
@@ -331,6 +378,57 @@ pub fn v1_structural_violation(
         }
         _ => None,
     }
+}
+
+/// The v1 rule that `source_role` MUST be present on every
+/// `content_retrieved` event (spec 5.2.2, 5.7.5): without it a consumer
+/// cannot tell an agent-reported fetch from an origin- or edge-reported
+/// one. Kept separate from `v1_structural_violation` because `source_role`
+/// is an event-level field, not a `data` member.
+pub fn source_role_violation(event_type: &str, source_role: Option<&str>) -> Option<String> {
+    if event_type == "content_retrieved" && !source_role.is_some_and(|v| !v.is_empty()) {
+        Some("content_retrieved events must carry source_role".to_string())
+    } else {
+        None
+    }
+}
+
+/// The v1 field-placement rules (spec 5.7.5): fields scoped to one event
+/// type MUST NOT appear on others. `presentation_id` and the event-level
+/// `ctx_token` belong only on `content_engaged`; `citation_id` only on
+/// `content_presented`; `turn` only on `turn_started` and `turn_completed`.
+/// Returns a description of the first misplaced field, or None.
+pub fn field_placement_violation(
+    event_type: &str,
+    presentation_id_present: bool,
+    ctx_token_present: bool,
+    citation_id_present: bool,
+    turn_present: bool,
+) -> Option<String> {
+    if event_type != "content_engaged" {
+        if presentation_id_present {
+            return Some(format!(
+                "presentation_id may only appear on content_engaged events, not {event_type}"
+            ));
+        }
+        if ctx_token_present {
+            return Some(format!(
+                "an event-level ctx_token may only appear on content_engaged events, not \
+                 {event_type}"
+            ));
+        }
+    }
+    if citation_id_present && event_type != "content_presented" {
+        return Some(format!(
+            "citation_id may only appear on content_presented events, not {event_type}"
+        ));
+    }
+    if turn_present && !matches!(event_type, "turn_started" | "turn_completed") {
+        return Some(format!(
+            "turn may only appear on turn_started and turn_completed events, not {event_type}"
+        ));
+    }
+    None
 }
 
 /// Conversation-turn fields that MUST NOT be present at each privacy level
@@ -733,6 +831,153 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn v1_structure_requires_grounding_scope() {
+        let ok = |data: &Value| {
+            v1_structural_violation(
+                "content_grounded",
+                false,
+                None,
+                false,
+                Some("https://example.com/a"),
+                None,
+                data,
+            )
+        };
+        assert!(ok(&json!({ "scope": "session" })).is_none());
+        assert!(ok(&json!({ "scope": "turn" })).is_none());
+        assert!(ok(&json!({})).is_some(), "missing scope must be rejected");
+        assert!(
+            ok(&json!({ "scope": "paragraph" })).is_some(),
+            "out-of-set scope must be rejected"
+        );
+    }
+
+    #[test]
+    fn v1_structure_requires_provenance_cached_consistency() {
+        let check = |data: Value| {
+            v1_structural_violation(
+                "content_grounded",
+                false,
+                None,
+                false,
+                Some("https://example.com/a"),
+                None,
+                &data,
+            )
+        };
+        // agent_fetched asserts a live fetch: cached must be false.
+        assert!(
+            check(json!({ "scope": "turn", "provenance": "agent_fetched", "cached": false }))
+                .is_none()
+        );
+        assert!(
+            check(json!({ "scope": "turn", "provenance": "agent_fetched", "cached": true }))
+                .is_some()
+        );
+        assert!(check(json!({ "scope": "turn", "provenance": "agent_fetched" })).is_some());
+        // agent_cached asserts reuse: cached must be true.
+        assert!(
+            check(json!({ "scope": "turn", "provenance": "agent_cached", "cached": true }))
+                .is_none()
+        );
+        assert!(
+            check(json!({ "scope": "turn", "provenance": "agent_cached", "cached": false }))
+                .is_some()
+        );
+        assert!(check(json!({ "scope": "turn", "provenance": "agent_cached" })).is_some());
+        // third_party_sourced leaves cached unconstrained (spec 6.4).
+        assert!(
+            check(json!({ "scope": "turn", "provenance": "third_party_sourced", "cached": true }))
+                .is_none()
+        );
+        assert!(check(json!({ "scope": "turn", "provenance": "third_party_sourced" })).is_none());
+        // Absent provenance constrains nothing.
+        assert!(check(json!({ "scope": "turn", "cached": true })).is_none());
+    }
+
+    #[test]
+    fn v1_structure_requires_citation_type() {
+        let check = |data: Value| {
+            v1_structural_violation(
+                "content_cited",
+                true,
+                Some("response:1"),
+                false,
+                Some("https://example.com/a"),
+                None,
+                &data,
+            )
+        };
+        assert!(check(json!({ "citation_type": "unclassified" })).is_none());
+        assert!(
+            check(json!({})).is_some(),
+            "missing citation_type must be rejected"
+        );
+    }
+
+    #[test]
+    fn source_role_required_on_retrieval_only() {
+        assert!(source_role_violation("content_retrieved", None).is_some());
+        assert!(source_role_violation("content_retrieved", Some("")).is_some());
+        assert!(source_role_violation("content_retrieved", Some("edge")).is_none());
+        assert!(source_role_violation("content_grounded", None).is_none());
+        assert!(source_role_violation("turn_started", None).is_none());
+    }
+
+    #[test]
+    fn scoped_fields_may_not_appear_on_other_types() {
+        // Conforming placements pass.
+        assert!(field_placement_violation("content_engaged", true, true, false, false).is_none());
+        assert!(
+            field_placement_violation("content_presented", false, false, true, false).is_none()
+        );
+        assert!(field_placement_violation("turn_started", false, false, false, true).is_none());
+        assert!(field_placement_violation("turn_completed", false, false, false, true).is_none());
+
+        // Misplacements are violations (spec 5.7.5).
+        assert!(
+            field_placement_violation("content_presented", true, false, false, false).is_some()
+        );
+        assert!(
+            field_placement_violation("content_retrieved", false, true, false, false).is_some()
+        );
+        assert!(field_placement_violation("content_cited", false, false, true, false).is_some());
+        assert!(field_placement_violation("content_engaged", true, false, true, false).is_some());
+        assert!(field_placement_violation("content_grounded", false, false, false, true).is_some());
+        assert!(
+            field_placement_violation("checkout_completed", false, false, false, true).is_some()
+        );
+    }
+
+    #[test]
+    fn withdrawn_preserved_in_output_is_stripped_from_fingerprints() {
+        let mut data = json!({
+            "scope": "turn",
+            "content_fingerprint": {
+                "scheme": "example:watermark",
+                "detected": true,
+                "preserved_in_output": true
+            }
+        });
+        assert_eq!(
+            strip_withdrawn_data_fields(&mut data),
+            vec!["content_fingerprint.preserved_in_output"]
+        );
+        assert_eq!(data["content_fingerprint"]["detected"], true);
+        assert!(
+            data["content_fingerprint"]
+                .get("preserved_in_output")
+                .is_none()
+        );
+
+        // A conforming fingerprint is left alone.
+        let mut clean = json!({
+            "content_fingerprint": { "scheme": "example:watermark", "detected": false }
+        });
+        assert!(strip_withdrawn_data_fields(&mut clean).is_empty());
     }
 
     #[test]

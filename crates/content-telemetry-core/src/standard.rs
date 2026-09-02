@@ -66,6 +66,16 @@ fn meets_v1_structure(row: &EventRow, prepared_data: &Value) -> bool {
         prepared_data,
     )
     .is_none()
+        && crate::conformance::source_role_violation(&row.event_type, row.source_role.as_deref())
+            .is_none()
+        && crate::conformance::field_placement_violation(
+            &row.event_type,
+            row.presentation_id.is_some(),
+            false, // stored rows gain a ctx_token column in migration 0003
+            row.citation_id.is_some(),
+            row.turn_data.is_some(),
+        )
+        .is_none()
 }
 
 fn insert_if_some(obj: &mut Map<String, Value>, key: &str, value: Option<Value>) {
