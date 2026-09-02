@@ -46,7 +46,14 @@ pub struct AgentBreakdown {
     /// Bot name from edge detection (event_data.bot_name), e.g. "ClaudeBot".
     /// Set when agent_id is null and the edge worker identified a known bot UA.
     pub bot_name: Option<String>,
-    /// Edge-detected bot purpose: "training" | "inference" | "search".
+    /// Access purpose as classified by the reporting party (spec 6.2):
+    /// "training" | "inference" | "search" | "advertising", open enum.
+    /// Read from event_data.purpose, falling back to the v0.1 name
+    /// bot_category (spec 12.1).
+    pub purpose: Option<String>,
+    /// Deprecated alias for `purpose` (the v0.1 field name). Carries the
+    /// same value during the transition so existing dashboard readers keep
+    /// working; new readers use `purpose`.
     pub bot_category: Option<String>,
     pub event_count: i64,
     pub session_count: i64,
@@ -104,13 +111,14 @@ pub struct DayFunnelCount {
     pub date: NaiveDate,
     pub retrieved: i64,
     pub grounded: i64,
-    /// Reproduction and citation are sibling response-layer claims
-    /// (spec 4.3), not consecutive funnel stages.
-    pub reproduced: i64,
     pub cited: i64,
     /// Includes stored v0.1 `content_displayed` events, so charts stay
     /// continuous across the v1 rename.
     pub presented: i64,
+    /// Deprecated alias for `presented` (the v0.1 stage name). Carries the
+    /// same value during the transition - the website dashboard still reads
+    /// `displayed`; a coordinated rename retires it.
+    pub displayed: i64,
     pub engaged: i64,
 }
 
@@ -119,7 +127,7 @@ pub struct DayFunnelCount {
 /// Edge counts come from the publisher's own emitter under its own key —
 /// zero trust in the agent required. Everything past retrieval is
 /// agent-attested: correlation operates at the retrieval level only (spec
-/// s7.3), so grounded/cited/displayed/engaged counts are what the agent
+/// s7.3), so grounded/cited/presented/engaged counts are what the agent
 /// *says*, deterrence-audited, never corroborated. The field names say so.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentReconciliation {
@@ -148,6 +156,11 @@ pub struct AgentReconciliation {
 pub struct AgentAttestedCounts {
     pub grounded: i64,
     pub cited: i64,
+    /// Presented count; stored v0.1 `content_displayed` rows are counted
+    /// inside this stage so history stays continuous across the v1 rename.
+    pub presented: i64,
+    /// Deprecated alias for `presented` (the v0.1 stage name). Same value
+    /// during the transition; the website dashboard still reads it.
     pub displayed: i64,
     pub engaged: i64,
 }
@@ -248,8 +261,11 @@ pub struct PublisherQueryParams {
     /// Filter to a specific bot name from edge detection
     /// (event_data.bot_name), e.g. "ClaudeBot".
     pub bot: Option<String>,
-    /// Filter to a bot category ("training" | "inference" | "search").
-    pub bot_category: Option<String>,
+    /// Filter to an access purpose ("training" | "inference" | "search" |
+    /// "advertising", spec 6.2). `bot_category` is accepted as a deprecated
+    /// alias for the v0.1 field name (spec 12.1).
+    #[serde(alias = "bot_category")]
+    pub purpose: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -287,7 +303,9 @@ pub struct PaginatedQueryParams {
     pub until: Option<DateTime<Utc>>,
     pub domain: Option<String>,
     pub bot: Option<String>,
-    pub bot_category: Option<String>,
+    /// Access-purpose filter; `bot_category` accepted as a deprecated alias.
+    #[serde(alias = "bot_category")]
+    pub purpose: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]

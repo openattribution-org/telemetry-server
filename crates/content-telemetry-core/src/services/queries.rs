@@ -20,7 +20,7 @@ pub async fn get_publisher_summary(
     until: Option<DateTime<Utc>>,
     domain_filter: Option<&str>,
     bot: Option<&str>,
-    bot_category: Option<&str>,
+    purpose: Option<&str>,
 ) -> Result<PublisherSummary, sqlx::Error> {
     let effective = effective_domains(domains, domain_filter);
     let patterns: Vec<String> = domain_like_patterns(&effective);
@@ -33,7 +33,7 @@ pub async fn get_publisher_summary(
     //
     // LEFT JOIN sessions so a bot filter can reach session-attached events.
     // Edge events identify their bot via event_data->>'bot_name'; agent
-    // self-report events (grounded/reproduced/cited/presented/engaged)
+    // self-report events (grounded/cited/presented/engaged)
     // identify it via the session's agent_id, mirroring the agent
     // breakdown's identity model.
     // Without this join, any bot filter silently drops every non-edge funnel
@@ -66,12 +66,14 @@ pub async fn get_publisher_summary(
         ));
         param_idx += 1;
     }
-    if bot_category.is_some() {
-        // Category lives on event_data only; agent self-report events carry it
-        // when the emitter stamps it (the demo generator does). There is no
-        // category column on sessions to fall back to.
+    if purpose.is_some() {
+        // Purpose lives on event_data only; agent self-report events carry
+        // it when the emitter stamps it (the demo generator does). There is
+        // no purpose column on sessions to fall back to. COALESCE reads the
+        // v1 'purpose' name first and falls back to the stored v0.1
+        // 'bot_category' rows (spec 12.1).
         query.push_str(&format!(
-            " AND e.event_data->>'bot_category' = ${param_idx}"
+            " AND COALESCE(e.event_data->>'purpose', e.event_data->>'bot_category') = ${param_idx}"
         ));
     }
     query.push_str(" GROUP BY e.event_type ORDER BY count DESC");
@@ -89,7 +91,7 @@ pub async fn get_publisher_summary(
     if let Some(b) = bot {
         q = q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         q = q.bind(c);
     }
 
@@ -97,9 +99,9 @@ pub async fn get_publisher_summary(
     // they scan the same data independently, so parallelising cuts dashboard latency.
     let (rows, source_rows, status_rows, agents) = tokio::try_join!(
         q.fetch_all(pool),
-        query_source_breakdown(pool, &patterns, since, until, bot, bot_category),
-        query_status_breakdown(pool, &patterns, since, until, bot, bot_category),
-        query_agent_breakdown(pool, &patterns, since, until, bot, bot_category),
+        query_source_breakdown(pool, &patterns, since, until, bot, purpose),
+        query_status_breakdown(pool, &patterns, since, until, bot, purpose),
+        query_agent_breakdown(pool, &patterns, since, until, bot, purpose),
     )?;
 
     let total_events: i64 = rows.iter().map(|r| r.count).sum();
@@ -143,7 +145,7 @@ pub async fn get_publisher_summary(
 }
 
 /// Get per-day funnel counts
-/// (retrieved/grounded/reproduced/cited/presented/engaged) for a publisher.
+/// (retrieved/grounded/cited/presented/engaged) for a publisher.
 ///
 /// One row per UTC day in the window. The dashboard chart previously
 /// bucketed a sampled events list client-side, which collapsed to "all
@@ -161,7 +163,7 @@ pub async fn get_publisher_timeseries(
     until: Option<DateTime<Utc>>,
     domain_filter: Option<&str>,
     bot: Option<&str>,
-    bot_category: Option<&str>,
+    purpose: Option<&str>,
 ) -> Result<Vec<DayFunnelCount>, sqlx::Error> {
     let effective = effective_domains(domains, domain_filter);
     let patterns: Vec<String> = domain_like_patterns(&effective);
@@ -174,8 +176,9 @@ pub async fn get_publisher_timeseries(
         "SELECT date_trunc('day', e.event_timestamp)::date AS day,
                 COUNT(*) FILTER (WHERE e.event_type = 'content_retrieved') AS retrieved,
                 COUNT(*) FILTER (WHERE e.event_type = 'content_grounded') AS grounded,
-                COUNT(*) FILTER (WHERE e.event_type = 'content_reproduced') AS reproduced,
                 COUNT(*) FILTER (WHERE e.event_type = 'content_cited')    AS cited,
+                -- Legacy branch: stored v0.1 content_displayed rows count
+                -- inside the presented stage (spec 12.1 renamed the type).
                 COUNT(*) FILTER (WHERE e.event_type IN ('content_presented','content_displayed')) AS presented,
                 COUNT(*) FILTER (WHERE e.event_type = 'content_engaged')  AS engaged
          FROM events e
@@ -203,18 +206,18 @@ pub async fn get_publisher_timeseries(
         ));
         param_idx += 1;
     }
-    if bot_category.is_some() {
-        // See get_publisher_summary: category lives on event_data only.
+    if purpose.is_some() {
+        // See get_publisher_summary: purpose lives on event_data only.
         query.push_str(&format!(
-            " AND e.event_data->>'bot_category' = ${param_idx}"
+            " AND COALESCE(e.event_data->>'purpose', e.event_data->>'bot_category') = ${param_idx}"
         ));
     }
     query.push_str(
-        " AND e.event_type IN ('content_retrieved','content_grounded','content_reproduced','content_cited','content_presented','content_displayed','content_engaged') \
+        " AND e.event_type IN ('content_retrieved','content_grounded','content_cited','content_presented','content_displayed','content_engaged') \
          GROUP BY day ORDER BY day ASC",
     );
 
-    let mut q = sqlx::query_as::<_, (NaiveDate, i64, i64, i64, i64, i64, i64)>(&query);
+    let mut q = sqlx::query_as::<_, (NaiveDate, i64, i64, i64, i64, i64)>(&query);
     for pattern in &patterns {
         q = q.bind(pattern);
     }
@@ -227,7 +230,7 @@ pub async fn get_publisher_timeseries(
     if let Some(b) = bot {
         q = q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         q = q.bind(c);
     }
 
@@ -235,13 +238,15 @@ pub async fn get_publisher_timeseries(
     Ok(rows
         .into_iter()
         .map(
-            |(date, retrieved, grounded, reproduced, cited, presented, engaged)| DayFunnelCount {
+            |(date, retrieved, grounded, cited, presented, engaged)| DayFunnelCount {
                 date,
                 retrieved,
                 grounded,
-                reproduced,
                 cited,
                 presented,
+                // Same value under the deprecated v0.1 stage name during
+                // the transition; the dashboard still reads `displayed`.
+                displayed: presented,
                 engaged,
             },
         )
@@ -257,7 +262,7 @@ pub async fn get_publisher_events(
     until: Option<DateTime<Utc>>,
     domain_filter: Option<&str>,
     bot: Option<&str>,
-    bot_category: Option<&str>,
+    purpose: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> Result<Paginated<PublisherEvent>, sqlx::Error> {
@@ -275,7 +280,7 @@ pub async fn get_publisher_events(
     }
 
     let (count_sql, data_sql) =
-        build_publisher_event_queries(&patterns, since, until, bot, bot_category);
+        build_publisher_event_queries(&patterns, since, until, bot, purpose);
 
     let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
     for p in &patterns {
@@ -290,13 +295,13 @@ pub async fn get_publisher_events(
     if let Some(b) = bot {
         count_q = count_q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         count_q = count_q.bind(c);
     }
     let optional_count = usize::from(since.is_some())
         + usize::from(until.is_some())
         + usize::from(bot.is_some())
-        + usize::from(bot_category.is_some());
+        + usize::from(purpose.is_some());
     let full_data_sql = format!(
         "{data_sql} LIMIT ${} OFFSET ${}",
         patterns.len() + 1 + optional_count,
@@ -315,7 +320,7 @@ pub async fn get_publisher_events(
     if let Some(b) = bot {
         data_q = data_q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         data_q = data_q.bind(c);
     }
     data_q = data_q.bind(limit).bind(offset);
@@ -355,7 +360,7 @@ pub async fn get_publisher_url_metrics(
     until: Option<DateTime<Utc>>,
     domain_filter: Option<&str>,
     bot: Option<&str>,
-    bot_category: Option<&str>,
+    purpose: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> Result<Paginated<PublisherUrlMetric>, sqlx::Error> {
@@ -391,9 +396,9 @@ pub async fn get_publisher_url_metrics(
         time_filter.push_str(&format!(" AND e.event_data->>'bot_name' = ${param_idx}"));
         param_idx += 1;
     }
-    if bot_category.is_some() {
+    if purpose.is_some() {
         time_filter.push_str(&format!(
-            " AND e.event_data->>'bot_category' = ${param_idx}"
+            " AND COALESCE(e.event_data->>'purpose', e.event_data->>'bot_category') = ${param_idx}"
         ));
         param_idx += 1;
     }
@@ -419,7 +424,7 @@ pub async fn get_publisher_url_metrics(
     if let Some(b) = bot {
         count_q = count_q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         count_q = count_q.bind(c);
     }
     let data_sql = format!(
@@ -447,7 +452,7 @@ pub async fn get_publisher_url_metrics(
     if let Some(b) = bot {
         data_q = data_q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         data_q = data_q.bind(c);
     }
     data_q = data_q.bind(limit).bind(offset);
@@ -479,9 +484,9 @@ pub async fn get_publisher_url_metrics(
             tb_sql.push_str(&format!(" AND event_data->>'bot_name' = ${tb_param_idx}"));
             tb_param_idx += 1;
         }
-        if bot_category.is_some() {
+        if purpose.is_some() {
             tb_sql.push_str(&format!(
-                " AND event_data->>'bot_category' = ${tb_param_idx}"
+                " AND COALESCE(event_data->>'purpose', event_data->>'bot_category') = ${tb_param_idx}"
             ));
         }
         tb_sql.push_str(&format!(
@@ -498,7 +503,7 @@ pub async fn get_publisher_url_metrics(
         if let Some(b) = bot {
             tb_q = tb_q.bind(b);
         }
-        if let Some(c) = bot_category {
+        if let Some(c) = purpose {
             tb_q = tb_q.bind(c);
         }
         tb_q.fetch_all(pool).await?
@@ -645,8 +650,9 @@ pub async fn get_agent_timeseries(
         "SELECT date_trunc('day', e.event_timestamp)::date AS day,
                 COUNT(*) FILTER (WHERE e.event_type = 'content_retrieved') AS retrieved,
                 COUNT(*) FILTER (WHERE e.event_type = 'content_grounded') AS grounded,
-                COUNT(*) FILTER (WHERE e.event_type = 'content_reproduced') AS reproduced,
                 COUNT(*) FILTER (WHERE e.event_type = 'content_cited')    AS cited,
+                -- Legacy branch: stored v0.1 content_displayed rows count
+                -- inside the presented stage (spec 12.1 renamed the type).
                 COUNT(*) FILTER (WHERE e.event_type IN ('content_presented','content_displayed')) AS presented,
                 COUNT(*) FILTER (WHERE e.event_type = 'content_engaged')  AS engaged
          FROM events e
@@ -662,11 +668,11 @@ pub async fn get_agent_timeseries(
         query.push_str(&format!(" AND e.event_timestamp <= ${param_idx}"));
     }
     query.push_str(
-        " AND e.event_type IN ('content_retrieved','content_grounded','content_reproduced','content_cited','content_presented','content_displayed','content_engaged') \
+        " AND e.event_type IN ('content_retrieved','content_grounded','content_cited','content_presented','content_displayed','content_engaged') \
          GROUP BY day ORDER BY day ASC",
     );
 
-    let mut q = sqlx::query_as::<_, (NaiveDate, i64, i64, i64, i64, i64, i64)>(&query).bind(org_id);
+    let mut q = sqlx::query_as::<_, (NaiveDate, i64, i64, i64, i64, i64)>(&query).bind(org_id);
     if let Some(ref s) = since {
         q = q.bind(s);
     }
@@ -678,13 +684,15 @@ pub async fn get_agent_timeseries(
     Ok(rows
         .into_iter()
         .map(
-            |(date, retrieved, grounded, reproduced, cited, presented, engaged)| DayFunnelCount {
+            |(date, retrieved, grounded, cited, presented, engaged)| DayFunnelCount {
                 date,
                 retrieved,
                 grounded,
-                reproduced,
                 cited,
                 presented,
+                // Same value under the deprecated v0.1 stage name during
+                // the transition; the dashboard still reads `displayed`.
+                displayed: presented,
                 engaged,
             },
         )
@@ -1134,7 +1142,7 @@ fn build_publisher_event_queries(
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
     bot: Option<&str>,
-    bot_category: Option<&str>,
+    purpose: Option<&str>,
 ) -> (String, String) {
     let like_clauses: Vec<String> = (1..=patterns.len())
         .map(|i| format!("e.content_url LIKE ${i}"))
@@ -1155,9 +1163,9 @@ fn build_publisher_event_queries(
         time_filter.push_str(&format!(" AND e.event_data->>'bot_name' = ${param_idx}"));
         param_idx += 1;
     }
-    if bot_category.is_some() {
+    if purpose.is_some() {
         time_filter.push_str(&format!(
-            " AND e.event_data->>'bot_category' = ${param_idx}"
+            " AND COALESCE(e.event_data->>'purpose', e.event_data->>'bot_category') = ${param_idx}"
         ));
     }
 
@@ -1181,7 +1189,7 @@ async fn query_source_breakdown(
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
     bot: Option<&str>,
-    bot_category: Option<&str>,
+    purpose: Option<&str>,
 ) -> Result<Vec<SourceRoleRow>, sqlx::Error> {
     let like_clauses: Vec<String> = (1..=patterns.len())
         .map(|i| format!("e.content_url LIKE ${i}"))
@@ -1202,9 +1210,9 @@ async fn query_source_breakdown(
         time_filter.push_str(&format!(" AND e.event_data->>'bot_name' = ${param_idx}"));
         param_idx += 1;
     }
-    if bot_category.is_some() {
+    if purpose.is_some() {
         time_filter.push_str(&format!(
-            " AND e.event_data->>'bot_category' = ${param_idx}"
+            " AND COALESCE(e.event_data->>'purpose', e.event_data->>'bot_category') = ${param_idx}"
         ));
     }
 
@@ -1231,7 +1239,7 @@ async fn query_source_breakdown(
     if let Some(b) = bot {
         q = q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         q = q.bind(c);
     }
 
@@ -1244,7 +1252,7 @@ async fn query_status_breakdown(
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
     bot: Option<&str>,
-    bot_category: Option<&str>,
+    purpose: Option<&str>,
 ) -> Result<Vec<StatusCodeRow>, sqlx::Error> {
     let like_clauses: Vec<String> = (1..=patterns.len())
         .map(|i| format!("e.content_url LIKE ${i}"))
@@ -1265,9 +1273,9 @@ async fn query_status_breakdown(
         time_filter.push_str(&format!(" AND e.event_data->>'bot_name' = ${param_idx}"));
         param_idx += 1;
     }
-    if bot_category.is_some() {
+    if purpose.is_some() {
         time_filter.push_str(&format!(
-            " AND e.event_data->>'bot_category' = ${param_idx}"
+            " AND COALESCE(e.event_data->>'purpose', e.event_data->>'bot_category') = ${param_idx}"
         ));
     }
 
@@ -1298,7 +1306,7 @@ async fn query_status_breakdown(
     if let Some(b) = bot {
         q = q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         q = q.bind(c);
     }
 
@@ -1311,7 +1319,7 @@ async fn query_agent_breakdown(
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
     bot: Option<&str>,
-    bot_category: Option<&str>,
+    purpose: Option<&str>,
 ) -> Result<Vec<AgentBreakdown>, sqlx::Error> {
     let like_clauses: Vec<String> = (1..=patterns.len())
         .map(|i| format!("e.content_url LIKE ${i}"))
@@ -1332,9 +1340,9 @@ async fn query_agent_breakdown(
         time_filter.push_str(&format!(" AND e.event_data->>'bot_name' = ${param_idx}"));
         param_idx += 1;
     }
-    if bot_category.is_some() {
+    if purpose.is_some() {
         time_filter.push_str(&format!(
-            " AND e.event_data->>'bot_category' = ${param_idx}"
+            " AND COALESCE(e.event_data->>'purpose', e.event_data->>'bot_category') = ${param_idx}"
         ));
     }
 
@@ -1342,19 +1350,20 @@ async fn query_agent_breakdown(
     // fall back to the bot identity the edge worker stamps onto event_data.
     // Without this, every edge retrieval collapses into a single "Unknown" row.
     let bot_name_expr = "NULLIF(e.event_data->>'bot_name', '')";
-    let bot_category_expr = "NULLIF(e.event_data->>'bot_category', '')";
+    let purpose_expr =
+        "NULLIF(COALESCE(e.event_data->>'purpose', e.event_data->>'bot_category'), '')";
 
     // Get totals per agent
     let totals_sql = format!(
         "SELECT s.platform_id, s.agent_id,
                 {bot_name_expr} as bot_name,
-                {bot_category_expr} as bot_category,
+                {purpose_expr} as purpose,
                 COUNT(*) as event_count,
                 COUNT(DISTINCT e.session_id) as session_count
          FROM events e
          LEFT JOIN sessions s ON e.session_id = s.id
          WHERE ({where_like}){time_filter}
-         GROUP BY s.platform_id, s.agent_id, bot_name, bot_category
+         GROUP BY s.platform_id, s.agent_id, bot_name, purpose
          ORDER BY event_count DESC"
     );
 
@@ -1362,14 +1371,14 @@ async fn query_agent_breakdown(
     let source_sql = format!(
         "SELECT s.platform_id, s.agent_id,
                 {bot_name_expr} as bot_name,
-                {bot_category_expr} as bot_category,
+                {purpose_expr} as purpose,
                 e.source_role,
                 COUNT(*) as count,
                 COUNT(DISTINCT e.session_id) as sessions
          FROM events e
          LEFT JOIN sessions s ON e.session_id = s.id
          WHERE ({where_like}){time_filter}
-         GROUP BY s.platform_id, s.agent_id, bot_name, bot_category, e.source_role
+         GROUP BY s.platform_id, s.agent_id, bot_name, purpose, e.source_role
          ORDER BY s.platform_id, s.agent_id, count DESC"
     );
 
@@ -1377,13 +1386,13 @@ async fn query_agent_breakdown(
     let type_sql = format!(
         "SELECT s.platform_id, s.agent_id,
                 {bot_name_expr} as bot_name,
-                {bot_category_expr} as bot_category,
+                {purpose_expr} as purpose,
                 e.event_type,
                 COUNT(*) as count
          FROM events e
          LEFT JOIN sessions s ON e.session_id = s.id
          WHERE ({where_like}){time_filter}
-         GROUP BY s.platform_id, s.agent_id, bot_name, bot_category, e.event_type
+         GROUP BY s.platform_id, s.agent_id, bot_name, purpose, e.event_type
          ORDER BY s.platform_id, s.agent_id, count DESC"
     );
 
@@ -1400,7 +1409,7 @@ async fn query_agent_breakdown(
     if let Some(b) = bot {
         totals_q = totals_q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         totals_q = totals_q.bind(c);
     }
 
@@ -1417,7 +1426,7 @@ async fn query_agent_breakdown(
     if let Some(b) = bot {
         source_q = source_q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         source_q = source_q.bind(c);
     }
 
@@ -1434,7 +1443,7 @@ async fn query_agent_breakdown(
     if let Some(b) = bot {
         type_q = type_q.bind(b);
     }
-    if let Some(c) = bot_category {
+    if let Some(c) = purpose {
         type_q = type_q.bind(c);
     }
 
@@ -1451,12 +1460,12 @@ async fn query_agent_breakdown(
         Option<String>,
     );
 
-    // Group source breakdowns by (platform_id, agent_id, bot_name, bot_category)
+    // Group source breakdowns by (platform_id, agent_id, bot_name, purpose)
     let mut source_map: std::collections::HashMap<BreakdownKey, Vec<SourceRoleCount>> =
         std::collections::HashMap::new();
     for s in sources {
         source_map
-            .entry((s.platform_id, s.agent_id, s.bot_name, s.bot_category))
+            .entry((s.platform_id, s.agent_id, s.bot_name, s.purpose))
             .or_default()
             .push(SourceRoleCount {
                 source_role: s.source_role,
@@ -1465,12 +1474,12 @@ async fn query_agent_breakdown(
             });
     }
 
-    // Group event_type breakdowns by (platform_id, agent_id, bot_name, bot_category)
+    // Group event_type breakdowns by (platform_id, agent_id, bot_name, purpose)
     let mut type_map: std::collections::HashMap<BreakdownKey, Vec<EventTypeCount>> =
         std::collections::HashMap::new();
     for t in types {
         type_map
-            .entry((t.platform_id, t.agent_id, t.bot_name, t.bot_category))
+            .entry((t.platform_id, t.agent_id, t.bot_name, t.purpose))
             .or_default()
             .push(EventTypeCount {
                 event_type: t.event_type,
@@ -1485,7 +1494,7 @@ async fn query_agent_breakdown(
                 r.platform_id.clone(),
                 r.agent_id.clone(),
                 r.bot_name.clone(),
-                r.bot_category.clone(),
+                r.purpose.clone(),
             );
             let by_source = source_map.remove(&key).unwrap_or_default();
             let by_event_type = type_map.remove(&key).unwrap_or_default();
@@ -1493,7 +1502,10 @@ async fn query_agent_breakdown(
                 platform_id: r.platform_id,
                 agent_id: r.agent_id,
                 bot_name: r.bot_name,
-                bot_category: r.bot_category,
+                // The same value under both names during the bot_category →
+                // purpose transition (spec 12.1).
+                bot_category: r.purpose.clone(),
+                purpose: r.purpose,
                 event_count: r.event_count,
                 session_count: r.session_count,
                 by_source,
@@ -1564,7 +1576,7 @@ pub async fn get_publisher_reconciliation(
                     COUNT(*) FILTER (WHERE e.event_type = 'content_retrieved') AS self_retrievals,
                     COUNT(*) FILTER (WHERE e.event_type = 'content_grounded')  AS grounded,
                     COUNT(*) FILTER (WHERE e.event_type = 'content_cited')     AS cited,
-                    COUNT(*) FILTER (WHERE e.event_type = 'content_displayed') AS displayed,
+                    COUNT(*) FILTER (WHERE e.event_type IN ('content_presented','content_displayed')) AS presented,
                     COUNT(*) FILTER (WHERE e.event_type = 'content_engaged')   AS engaged,
                     COUNT(DISTINCT e.session_id) AS sessions_reporting
              FROM events e
@@ -1578,7 +1590,7 @@ pub async fn get_publisher_reconciliation(
                 COALESCE(self_report.self_retrievals, 0) AS self_reported_retrievals,
                 COALESCE(self_report.grounded, 0)      AS grounded,
                 COALESCE(self_report.cited, 0)         AS cited,
-                COALESCE(self_report.displayed, 0)     AS displayed,
+                COALESCE(self_report.presented, 0)     AS presented,
                 COALESCE(self_report.engaged, 0)       AS engaged,
                 COALESCE(self_report.sessions_reporting, 0) AS sessions_reporting
          FROM edge
@@ -1613,7 +1625,9 @@ pub async fn get_publisher_reconciliation(
             agent_attested: AgentAttestedCounts {
                 grounded: r.grounded,
                 cited: r.cited,
-                displayed: r.displayed,
+                presented: r.presented,
+                // Deprecated alias, same value during the transition.
+                displayed: r.presented,
                 engaged: r.engaged,
             },
         })
@@ -1806,7 +1820,7 @@ struct ReconciliationRow {
     self_reported_retrievals: i64,
     grounded: i64,
     cited: i64,
-    displayed: i64,
+    presented: i64,
     engaged: i64,
     sessions_reporting: i64,
 }
@@ -1855,7 +1869,7 @@ struct AgentBreakdownRow {
     platform_id: Option<String>,
     agent_id: Option<String>,
     bot_name: Option<String>,
-    bot_category: Option<String>,
+    purpose: Option<String>,
     event_count: i64,
     session_count: i64,
 }
@@ -1878,7 +1892,7 @@ struct AgentSourceRow {
     platform_id: Option<String>,
     agent_id: Option<String>,
     bot_name: Option<String>,
-    bot_category: Option<String>,
+    purpose: Option<String>,
     source_role: Option<String>,
     count: i64,
     sessions: i64,
@@ -1889,7 +1903,7 @@ struct AgentTypeRow {
     platform_id: Option<String>,
     agent_id: Option<String>,
     bot_name: Option<String>,
-    bot_category: Option<String>,
+    purpose: Option<String>,
     event_type: String,
     count: i64,
 }
