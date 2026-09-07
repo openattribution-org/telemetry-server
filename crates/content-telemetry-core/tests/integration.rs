@@ -4,9 +4,10 @@ use uuid::Uuid;
 
 use content_telemetry_core::models::event::{EdgeEventInput, TelemetryEventInput};
 use content_telemetry_core::models::session::{
-    SessionCreateRequest, SessionEndRequest, SessionOutcome,
+    BulkSessionRequest, SessionCreateRequest, SessionEndRequest, SessionOutcome,
 };
 use content_telemetry_core::services::{click_tokens, events, queries, sessions};
+use content_telemetry_core::{conformance, standard};
 
 // ---------------------------------------------------------------------------
 // Test constants
@@ -768,4 +769,114 @@ async fn publisher_summary_breaks_down_status_codes(pool: PgPool) {
         2,
         "malformed and statusless events fold into the NULL bucket"
     );
+}
+
+// ===================================================================
+// Session data container (specification section 5.1.3)
+// ===================================================================
+
+/// The standard's own fixtures, copied byte-for-byte; see `spec/README.md`.
+const SPEC_SESSION_ACCESS_CONTEXT: &str = include_str!("spec/session-access-context.json");
+const SPEC_IDENTIFIER_MISSING_VALUE: &str =
+    include_str!("spec/access-context-identifier-missing-value.json");
+const SPEC_IDENTIFIERS_NOT_ARRAY: &str =
+    include_str!("spec/access-context-identifiers-not-array.json");
+
+fn spec_document(source: &str) -> serde_json::Value {
+    serde_json::from_str(source).expect("spec fixture is valid JSON")
+}
+
+#[sqlx::test(migrations = "./migrations", fixtures("setup"))]
+async fn spec_access_context_survives_ingest_and_retrieval(pool: PgPool) {
+    let org = agent_org_id();
+    let document = spec_document(SPEC_SESSION_ACCESS_CONTEXT);
+
+    let request: BulkSessionRequest =
+        serde_json::from_value(document.clone()).expect("the spec fixture deserialises");
+    assert!(
+        conformance::session_data_violation(request.data.as_ref()).is_none(),
+        "the standard's own valid fixture must pass the access_context check"
+    );
+
+    let session = sessions::create_session(&pool, org, &request.session_create())
+        .await
+        .unwrap();
+    events::create_events(&pool, session.id, org, &request.events)
+        .await
+        .unwrap();
+
+    let stored = sessions::get_session_with_events(&pool, session.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let materialised = standard::standard_document(&stored);
+
+    // The round trip is lossless: the container comes back as sent, both
+    // core schemes included, with nothing normalised or reordered.
+    assert_eq!(materialised["data"], document["data"]);
+    assert_eq!(
+        materialised["data"]["access_context"]["identifiers"][0]["value"],
+        "https://ror.org/013meh722"
+    );
+    assert_eq!(
+        materialised["data"]["access_context"]["identifiers"][1]["scheme"],
+        "saml_entity_id"
+    );
+    assert_eq!(materialised["events"].as_array().unwrap().len(), 4);
+
+    // The fixture's `_test_description` is an upstream harness annotation,
+    // not a member of the document format. It is undefined at the session
+    // root (spec 5.1.3), so it is recorded rather than dropped (spec 5.7.4).
+    assert_eq!(
+        materialised["extensions"]["unrecognised_fields"]["_test_description"],
+        document["_test_description"]
+    );
+}
+
+#[sqlx::test(migrations = "./migrations", fixtures("setup"))]
+async fn unknown_identifier_schemes_survive_ingest_and_retrieval(pool: PgPool) {
+    // Emitters MAY use schemes outside the core three and consumers MUST
+    // tolerate them (spec 5.1.3), so an unknown scheme is stored and served
+    // like any other.
+    let org = agent_org_id();
+    let data = serde_json::json!({
+        "access_context": {
+            "identifiers": [
+                { "scheme": "example_consortium", "value": "seat-4471" }
+            ]
+        },
+        "com.example.reporting_period": "2026-08"
+    });
+
+    let request: SessionCreateRequest = serde_json::from_value(serde_json::json!({
+        "initiator_type": "agent",
+        "agent_id": "scholar-assistant.example.com",
+        "data": data.clone(),
+    }))
+    .unwrap();
+    assert!(conformance::session_data_violation(request.data.as_ref()).is_none());
+
+    let session = sessions::create_session(&pool, org, &request)
+        .await
+        .unwrap();
+    let stored = sessions::get_session_with_events(&pool, session.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(standard::standard_document(&stored)["data"], data);
+}
+
+#[test]
+fn spec_invalid_access_context_fixtures_are_refused() {
+    for source in [SPEC_IDENTIFIER_MISSING_VALUE, SPEC_IDENTIFIERS_NOT_ARRAY] {
+        let document = spec_document(source);
+        let request: BulkSessionRequest = serde_json::from_value(document.clone()).unwrap();
+        let violation = conformance::session_data_violation(request.data.as_ref());
+        assert!(
+            violation.is_some(),
+            "the standard's invalid fixture should be refused: {}",
+            document["_test_description"]
+        );
+    }
 }

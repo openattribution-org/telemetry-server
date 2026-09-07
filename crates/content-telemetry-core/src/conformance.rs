@@ -84,6 +84,17 @@ pub const WITHDRAWN_EVENT_TYPE_DISPLAYED: &str = "content_displayed";
 /// v1 transition rule, not a general registry of withdrawn extension names.
 pub const WITHDRAWN_EVENT_DATA_FIELDS: &[&str] = &["ip_hash"];
 
+/// The one container core defines inside the session-level `data` object
+/// (spec 5.1.3): the context from which the session's access rights derive,
+/// an institution and never an individual. COUNTER usage reporting needs it,
+/// which is why it is in core rather than in an extension.
+pub const SESSION_ACCESS_CONTEXT: &str = "access_context";
+
+/// Identifier schemes named in core (spec 5.1.3). Informative only: the
+/// vocabulary is open, emitters MAY use others, and consumers MUST tolerate
+/// unknown ones, so nothing validates against this list.
+pub const CORE_ACCESS_CONTEXT_SCHEMES: &[&str] = &["ror", "saml_entity_id", "isni"];
+
 /// Conversation-turn privacy levels (spec 5.4). A closed enum: the schema
 /// rejects a turn whose `privacy_level` is outside this set.
 pub const PRIVACY_LEVELS: &[&str] = &["full", "summary", "intent", "minimal"];
@@ -378,6 +389,68 @@ pub fn v1_structural_violation(
         }
         _ => None,
     }
+}
+
+/// The shape the schema gives the session-level `data` container's one core
+/// member, `access_context` (spec 5.1.3): `identifiers` is an array, and
+/// every entry is an object carrying a `scheme` and a `value`, both strings.
+///
+/// Only the shape is checked. Scheme values are open — `ror`,
+/// `saml_entity_id` and `isni` are the core ones and a consumer MUST
+/// tolerate any other — and additional members inside `data`, inside
+/// `access_context` and inside an identifier are tolerated unchanged,
+/// because consumers MUST tolerate unknown fields within the container.
+///
+/// Returns a description of the first violation, or None.
+pub fn session_data_violation(data: Option<&Value>) -> Option<String> {
+    let data = data?;
+    if data.is_null() {
+        return None;
+    }
+    let Some(data) = data.as_object() else {
+        return Some("session data must be an object".to_string());
+    };
+
+    let access_context = data.get(SESSION_ACCESS_CONTEXT)?;
+    if access_context.is_null() {
+        return None;
+    }
+    let Some(access_context) = access_context.as_object() else {
+        return Some("data.access_context must be an object".to_string());
+    };
+
+    let identifiers = access_context.get("identifiers")?;
+    let Some(identifiers) = identifiers.as_array() else {
+        return Some(
+            "data.access_context.identifiers must be an array of {scheme, value} objects"
+                .to_string(),
+        );
+    };
+
+    for (index, identifier) in identifiers.iter().enumerate() {
+        let Some(identifier) = identifier.as_object() else {
+            return Some(format!(
+                "data.access_context.identifiers[{index}] must be an object"
+            ));
+        };
+        for member in ["scheme", "value"] {
+            match identifier.get(member) {
+                Some(v) if v.is_string() => {}
+                Some(_) => {
+                    return Some(format!(
+                        "data.access_context.identifiers[{index}].{member} must be a string"
+                    ));
+                }
+                None => {
+                    return Some(format!(
+                        "data.access_context.identifiers[{index}] requires {member}"
+                    ));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// The v1 rule that `source_role` MUST be present on every
@@ -1145,5 +1218,70 @@ mod tests {
             "response_tokens": 12
         });
         assert!(strip_turn_privacy_violations(&mut turn).is_empty());
+    }
+
+    #[test]
+    fn access_context_shape_is_checked_and_its_vocabulary_is_not() {
+        // The spec's own example (5.1.3), plus a scheme core does not name.
+        // Consumers MUST tolerate unknown schemes, so the unknown one is not
+        // a violation.
+        let spec_example = json!({
+            "access_context": {
+                "identifiers": [
+                    { "scheme": "ror", "value": "https://ror.org/013meh722" },
+                    { "scheme": "saml_entity_id", "value": "https://idp.example.ac.uk/shibboleth" },
+                    { "scheme": "example_local", "value": "lib-4471" }
+                ]
+            }
+        });
+        assert!(session_data_violation(Some(&spec_example)).is_none());
+
+        // Unknown fields inside the container, inside access_context and
+        // inside an identifier are all tolerated (5.1.3).
+        let extras = json!({
+            "com.example.reporting_period": "2026-08",
+            "access_context": {
+                "asserted_by": "agent",
+                "identifiers": [
+                    { "scheme": "isni", "value": "0000000121032683", "note": "consortium seat" }
+                ]
+            }
+        });
+        assert!(session_data_violation(Some(&extras)).is_none());
+
+        // A container with no access_context, and no container at all.
+        assert!(session_data_violation(Some(&json!({ "x": 1 }))).is_none());
+        assert!(session_data_violation(None).is_none());
+        assert!(session_data_violation(Some(&Value::Null)).is_none());
+    }
+
+    #[test]
+    fn malformed_access_context_is_a_violation() {
+        // Both cases are the standard's own invalid fixtures.
+        let missing_value = json!({
+            "access_context": { "identifiers": [{ "scheme": "ror" }] }
+        });
+        assert_eq!(
+            session_data_violation(Some(&missing_value)).as_deref(),
+            Some("data.access_context.identifiers[0] requires value")
+        );
+
+        let not_an_array = json!({
+            "access_context": { "identifiers": "https://ror.org/013meh722" }
+        });
+        assert!(
+            session_data_violation(Some(&not_an_array))
+                .is_some_and(|v| v.contains("must be an array"))
+        );
+
+        let non_string_scheme = json!({
+            "access_context": { "identifiers": [{ "scheme": 7, "value": "x" }] }
+        });
+        assert_eq!(
+            session_data_violation(Some(&non_string_scheme)).as_deref(),
+            Some("data.access_context.identifiers[0].scheme must be a string")
+        );
+
+        assert!(session_data_violation(Some(&json!("not an object"))).is_some());
     }
 }

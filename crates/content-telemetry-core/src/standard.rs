@@ -213,8 +213,27 @@ pub fn standard_document(swe: &SessionWithEvents) -> Value {
     );
     doc.insert("started_at".to_string(), json!(session.started_at));
     insert_if_some(&mut doc, "ended_at", session.ended_at.map(|v| json!(v)));
+    // The session-level data container (spec 5.1.3), served back exactly as
+    // it arrived. Consumers MUST tolerate unknown fields within it and
+    // unknown `access_context` identifier schemes, so nothing inside is
+    // normalised, defaulted or dropped: the round trip is lossless.
+    insert_if_some(&mut doc, "data", session.session_data.clone());
 
     let mut extensions = Map::new();
+
+    // Top-level members this server does not define. The session root is not
+    // an extension point (spec 5.1.3) and they are not interpreted, but a
+    // consumer MUST tolerate unknown fields without error (spec 5.7.4), so
+    // they are returned rather than dropped — a document cannot lose data
+    // here without the loss being visible.
+    if let Some(Value::Object(unrecognised)) = session.unrecognised_fields.as_ref()
+        && !unrecognised.is_empty()
+    {
+        extensions.insert(
+            "unrecognised_fields".to_string(),
+            Value::Object(unrecognised.clone()),
+        );
+    }
 
     // Normalise on read as well as ingest: rows written by a pre-rename
     // binary during the 0011 deploy window can still carry the legacy
@@ -324,6 +343,8 @@ mod tests {
             agent_id: Some("test-agent".to_string()),
             external_session_id: None,
             prior_session_ids: None,
+            session_data: None,
+            unrecognised_fields: None,
             user_context: json!({}),
             platform_id: None,
             client_type: None,
@@ -452,6 +473,59 @@ mod tests {
         assert_eq!(
             event_types(&doc, "/extensions/events"),
             vec!["content_grounded"]
+        );
+    }
+
+    #[test]
+    fn session_data_materialises_at_the_document_root() {
+        // The container is served back byte-for-byte, unknown identifier
+        // schemes and namespaced neighbours included (spec 5.1.3).
+        let data = json!({
+            "access_context": {
+                "identifiers": [
+                    { "scheme": "ror", "value": "https://ror.org/013meh722" },
+                    { "scheme": "example_local", "value": "lib-4471", "note": "consortium seat" }
+                ]
+            },
+            "com.example.reporting_period": "2026-08"
+        });
+
+        let mut session = session_row();
+        session.session_data = Some(data.clone());
+
+        let doc = standard_document(&SessionWithEvents {
+            session,
+            events: vec![],
+        });
+
+        assert_eq!(doc["data"], data);
+        assert_eq!(
+            doc["data"]["access_context"]["identifiers"][1]["scheme"],
+            "example_local"
+        );
+    }
+
+    #[test]
+    fn undefined_top_level_fields_come_back_under_extensions() {
+        // The session root is not an extension point (spec 5.1.3), but a
+        // consumer MUST tolerate unknown fields without error (spec 5.7.4).
+        // Recording them is what makes the loss visible: a member this
+        // server does not implement is returned rather than dropped.
+        let mut session = session_row();
+        session.unrecognised_fields = Some(json!({ "access_summary": { "institutions": 3 } }));
+
+        let doc = standard_document(&SessionWithEvents {
+            session,
+            events: vec![],
+        });
+
+        assert!(
+            doc.get("access_summary").is_none(),
+            "an undefined member must not be promoted to a standard field"
+        );
+        assert_eq!(
+            doc["extensions"]["unrecognised_fields"]["access_summary"]["institutions"],
+            3
         );
     }
 

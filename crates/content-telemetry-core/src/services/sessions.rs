@@ -35,16 +35,26 @@ pub async fn create_session(
         );
     }
 
+    // The session-level `data` container and any top-level members this
+    // server does not define are stored as given (spec 5.1.3): nothing
+    // inside either is interpreted, normalised or dropped.
+    let unrecognised = if req.unrecognised_fields.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(req.unrecognised_fields.clone()))
+    };
+
     sqlx::query_as::<_, SessionRow>(
         r"INSERT INTO sessions (
             organization_id, parent_session_id, initiator_type, initiator,
             content_scope, manifest_ref, conformance_level,
             agent_id, external_session_id, prior_session_ids,
+            session_data, unrecognised_fields,
             user_context, platform_id, client_type, client_info,
             started_at, ended_at
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                COALESCE($15, NOW()), $16)
+                $15, $16, COALESCE($17, NOW()), $18)
         RETURNING *",
     )
     .bind(owner_id)
@@ -57,6 +67,8 @@ pub async fn create_session(
     .bind(&req.agent_id)
     .bind(&req.external_session_id)
     .bind(&prior)
+    .bind(&req.data)
+    .bind(&unrecognised)
     .bind(&req.user_context)
     .bind(&req.platform_id)
     .bind(&req.client_type)

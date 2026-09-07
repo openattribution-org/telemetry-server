@@ -157,6 +157,27 @@ RESP=$(curl -s -X POST "$BASE/sessions/bulk" -H 'content-type: application/json'
 [ "$(echo "$RESP" | jget 'd.get("events_created","ERR")')" = "1" ] && ok "bulk document ingested" || bad "bulk failed: $RESP"
 [ "$(echo "$RESP" | jget 'str(d.get("outcome_recorded"))')" = "True" ] && ok "bulk outcome recorded" || bad "bulk outcome not recorded: $RESP"
 
+echo "== session data container (5.1.3)"
+BULK=$(curl -s -X POST "$BASE/sessions/bulk" -H 'content-type: application/json' -H "x-organization-id: $AGENT" \
+  -d "{\"document_type\":\"session\",\"schema_version\":\"1.0\",\"session_id\":\"$(uuid)\",\"agent_id\":\"demo-agent\",
+       \"data\":{\"access_context\":{\"identifiers\":[{\"scheme\":\"ror\",\"value\":\"https://ror.org/013meh722\"},{\"scheme\":\"example_local\",\"value\":\"seat-4471\"}]}},
+       \"institution_summary\":{\"seats\":3},
+       \"events\":[]}")
+SDATA=$(echo "$BULK" | jget 'd.get("session_id","")')
+[ -n "$SDATA" ] && ok "session document with access_context ingested" || bad "access_context ingest failed: $BULK"
+
+DOC=$(curl -s "$BASE/sessions/$SDATA/document" -H "x-organization-id: $AGENT")
+[ "$(echo "$DOC" | jget 'd["data"]["access_context"]["identifiers"][0]["value"]')" = "https://ror.org/013meh722" ] \
+  && ok "access_context served back on the session document" || bad "access_context missing: $DOC"
+[ "$(echo "$DOC" | jget 'd["data"]["access_context"]["identifiers"][1]["scheme"]')" = "example_local" ] \
+  && ok "unknown identifier scheme preserved" || bad "unknown scheme lost: $DOC"
+[ "$(echo "$DOC" | jget 'd["extensions"]["unrecognised_fields"]["institution_summary"]["seats"]')" = "3" ] \
+  && ok "undefined top-level field recorded, not discarded" || bad "undefined field lost: $DOC"
+
+RESP=$(curl -s -X POST "$BASE/sessions/bulk" -H 'content-type: application/json' -H "x-organization-id: $AGENT" \
+  -d "{\"schema_version\":\"1.0\",\"session_id\":\"$(uuid)\",\"data\":{\"access_context\":{\"identifiers\":[{\"scheme\":\"ror\"}]}},\"events\":[]}")
+echo "$RESP" | grep -q 'requires value' && ok "identifier without a value rejected" || bad "expected identifier error, got: $RESP"
+
 echo
 if [ "$FAILURES" -eq 0 ]; then echo "ALL CHECKS PASSED"; else echo "$FAILURES CHECK(S) FAILED"; fi
 exit "$FAILURES"

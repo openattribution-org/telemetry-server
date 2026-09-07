@@ -146,6 +146,23 @@ instead of rejection — enum synonyms, fields withdrawn on privacy grounds,
 turn content above the declared privacy level — the server normalises and logs
 what it changed.
 
+The session-level `data` container (section 5.1.3) is stored and served back
+unchanged, `access_context` included. Only its shape is checked:
+`identifiers` must be an array of objects each carrying a string `scheme` and
+a string `value`. The scheme vocabulary is open, so a scheme outside the core
+`ror`, `saml_entity_id` and `isni` is stored like any other, as are unknown
+members alongside `access_context` and inside it.
+
+Top-level members of a session document that this server does not define are
+recorded rather than dropped. The session root is not an extension point
+(section 5.1.3), so nothing there is interpreted, but a consumer must tolerate
+unknown fields without error (section 5.7.4), which rules out refusing the
+document. Ingest logs the member names and stores them on the session, and
+materialisation returns them under `extensions.unrecognised_fields`. A field
+the specification adds that this server does not implement yet is therefore
+visible in the log and in the document, rather than accepted into a success
+response and discarded.
+
 Materialising a session document keeps that honest in the other direction.
 Events that predate v1 or belong to an extension move under the document's
 `extensions` member rather than being dropped or rewritten, so the document
