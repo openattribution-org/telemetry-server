@@ -70,6 +70,8 @@ async fn start_session(
     Json(mut req): Json<SessionCreateRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     check_initiator_type(&req.initiator_type)?;
+    check_session_data(req.data.as_ref())?;
+    log_unrecognised_fields(&req.unrecognised_fields);
 
     // Informational only: the spec forbids rejecting a document over its
     // conformance level, so a value we do not recognise is logged and stored,
@@ -144,6 +146,8 @@ async fn bulk_session(
     };
 
     check_initiator_type(&req.initiator_type)?;
+    check_session_data(req.data.as_ref())?;
+    log_unrecognised_fields(&req.unrecognised_fields);
     if let Some(outcome) = req.outcome.as_ref() {
         check_outcome_type(&outcome.outcome_type)?;
     }
@@ -152,6 +156,16 @@ async fn bulk_session(
         return Err(too_large(req.events.len()));
     }
 
+    // The presented session id is the emitter's, not ours. It is stored as
+    // the external id under a server-minted primary key, so two emitters
+    // cannot collide on a chosen id and neither can address the other's row.
+    // The mapping lives on the document type: the session-level `data`
+    // container and any top-level members the server does not define travel
+    // to storage with everything else (spec 5.1.3).
+    let mut create = req.session_create();
+    create.conformance_level =
+        conformance::normalise_conformance_level(req.conformance_level.as_deref()).value;
+
     let mut events_in = req.events;
     for (index, event) in events_in.iter_mut().enumerate() {
         // Normalise before checking: a "0.1" document's migration defaults
@@ -159,39 +173,6 @@ async fn bulk_session(
         log_notes(validate::normalise(event, line));
         validate::check_event(event, line, state.max_event_age_days, index)?;
     }
-
-    let level = conformance::normalise_conformance_level(req.conformance_level.as_deref());
-
-    // The presented session id is the emitter's, not ours. It is stored as
-    // the external id under a server-minted primary key, so two emitters
-    // cannot collide on a chosen id and neither can address the other's row.
-    let create = SessionCreateRequest {
-        initiator_type: req.initiator_type,
-        initiator: req.initiator,
-        parent_session_id: req.parent_session_id,
-        content_scope: req.content_scope,
-        manifest_ref: req.manifest_ref,
-        conformance_level: level.value,
-        agent_id: req.agent_id,
-        external_session_id: Some(
-            req.external_session_id
-                .unwrap_or_else(|| req.session_id.to_string()),
-        ),
-        user_context: req.user_context,
-        prior_session_ids: req.prior_session_ids.iter().map(Uuid::to_string).collect(),
-        platform_id: req.platform_id,
-        client_type: req.client_type,
-        client_info: req.client_info,
-        started_at: req.started_at,
-        // Withheld when an outcome is present: end_session only updates a
-        // session whose ended_at is still NULL, so setting it here would
-        // silently drop the outcome.
-        ended_at: if req.outcome.is_some() {
-            None
-        } else {
-            req.ended_at
-        },
-    };
 
     let session = sessions::create_session(&state.pool, org, &create).await?;
 
@@ -577,6 +558,43 @@ fn check_initiator_type(value: &str) -> Result<(), ApiError> {
             "initiator_type must be 'user' or 'agent'",
         ))
     }
+}
+
+/// The session-level `data` container is an extension point, so almost
+/// nothing in it is checked — but `access_context` is defined in core (spec
+/// 5.1.3) and the schema gives it a shape, so a malformed one is refused
+/// rather than stored as a claim nobody can read.
+fn check_session_data(data: Option<&Value>) -> Result<(), ApiError> {
+    match conformance::session_data_violation(data) {
+        Some(violation) => Err(ApiError::bad_request(violation)),
+        None => Ok(()),
+    }
+}
+
+/// Record top-level members the server does not define.
+///
+/// The session root is not an extension point (spec 5.1.3) and a consumer
+/// MUST tolerate unknown fields without error (spec 5.7.4), so the document
+/// is accepted either way. What must not happen is accepting it silently:
+/// the members are logged here, stored on the session, and returned under
+/// the document's `extensions`. A field the specification adds that this
+/// server does not implement yet shows up in all three places instead of
+/// disappearing into a 201.
+fn log_unrecognised_fields(fields: &serde_json::Map<String, Value>) {
+    if fields.is_empty() {
+        return;
+    }
+
+    let names = fields
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::warn!(
+        fields = names,
+        "session document carries top-level fields this server does not define; stored and \
+         returned under extensions.unrecognised_fields (spec 5.1.3, 5.7.4)"
+    );
 }
 
 fn check_outcome_type(value: &str) -> Result<(), ApiError> {
